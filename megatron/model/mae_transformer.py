@@ -82,15 +82,20 @@ class ParallelMLP(MegatronModule):
     state back into h hidden dimension.
     """
 
-    def __init__(self, init_method, output_layer_init_method):
+    def __init__(self, init_method, output_layer_init_method, layer_type=LayerType.encoder):
         super(ParallelMLP, self).__init__()
         args = get_args()
-
+        if layer_type == LayerType.mae_decoder:
+            self.hidden_size = args.decoder_embed_dim
+            self.ffn_hidden_size = args.decoder_ffn_size
+        else:
+            self.hidden_size = args.hidden_size
+            self.ffn_hidden_size = args.ffn_hidden_size
 
         # Project to 4h.
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            args.hidden_size,
-            args.ffn_hidden_size,
+            self.hidden_size,
+            self.ffn_hidden_size,
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
@@ -106,8 +111,8 @@ class ParallelMLP(MegatronModule):
 
         # Project back to h.
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
-            args.ffn_hidden_size,
-            args.hidden_size,
+            self.ffn_hidden_size,
+            self.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
@@ -181,7 +186,8 @@ class SwitchMLP(MegatronModule):
 class CoreAttention(MegatronModule):
 
     def __init__(self, layer_number,
-                 attn_mask_type=AttnMaskType.padding):
+                 attn_mask_type=AttnMaskType.padding,
+                 layer_type = LayerType.encoder):
         super(CoreAttention, self).__init__()
         args = get_args()
         self.fp16 = args.fp16
@@ -195,16 +201,28 @@ class CoreAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.sequence_parallel = args.sequence_parallel
 
-        projection_size = args.kv_channels * args.num_attention_heads
+
+        if layer_type == LayerType.mae_decoder:
+            self.hidden_size = args.decoder_embed_dim
+            self.ffn_hidden_size = args.decoder_ffn_size
+            projection_size = args.kv_channels_decoder * args.decoder_num_attention_heads
+            self.num_attention_heads = args.decoder_num_attention_heads
+        else:
+            self.hidden_size = args.hidden_size
+            self.ffn_hidden_size = args.ffn_hidden_size
+            projection_size = args.kv_channels * args.num_attention_heads
+            self.num_attention_heads = args.num_attention_heads
+
+
 
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = core.utils.divide(projection_size,
                                                            world_size)
         self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, args.num_attention_heads)
+            projection_size, self.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
-            args.num_attention_heads, world_size)
+            self.num_attention_heads, world_size)
 
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
@@ -367,7 +385,8 @@ class ParallelAttention(MegatronModule):
     def __init__(self, init_method,
                  output_layer_init_method, layer_number,
                  attention_type=AttnType.self_attn,
-                 attn_mask_type=AttnMaskType.padding):
+                 attn_mask_type=AttnMaskType.padding,
+                 layer_type = LayerType.encoder):
         super(ParallelAttention, self).__init__()
         args = get_args()
         self.layer_number = max(1, layer_number)
@@ -387,20 +406,30 @@ class ParallelAttention(MegatronModule):
                                                                 'supports causal mask for now')
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
+        
+        if layer_type == LayerType.mae_decoder:
+            self.hidden_size = args.decoder_embed_dim
+            self.ffn_hidden_size = args.decoder_ffn_size
+            projection_size = args.kv_channels_decoder * args.decoder_num_attention_heads
+            self.num_attention_heads = args.decoder_num_attention_heads
+        else:
+            self.hidden_size = args.hidden_size
+            self.ffn_hidden_size = args.ffn_hidden_size
+            projection_size = args.kv_channels * args.num_attention_heads
+            self.num_attention_heads = args.decoder_num_attention_heads
 
-        projection_size = args.kv_channels * args.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, args.num_attention_heads)
+            projection_size, self.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
-            args.num_attention_heads, world_size)
+            self.num_attention_heads, world_size)
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                args.hidden_size,
+                self.hidden_size,
                 3 * projection_size,
                 gather_output=False,
                 init_method=init_method,
@@ -409,7 +438,7 @@ class ParallelAttention(MegatronModule):
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
-                args.hidden_size,
+                self.hidden_size,
                 projection_size,
                 gather_output=False,
                 init_method=init_method,
@@ -418,7 +447,7 @@ class ParallelAttention(MegatronModule):
 
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
-                args.hidden_size,
+                self.hidden_size,
                 2 * projection_size,
                 gather_output=False,
                 init_method=init_method,
@@ -426,7 +455,7 @@ class ParallelAttention(MegatronModule):
                 **_args_to_kwargs())
 
         self.core_attention = CoreAttention(self.layer_number,
-                                            self.attn_mask_type)
+                                            self.attn_mask_type, layer_type=layer_type)
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
@@ -437,7 +466,7 @@ class ParallelAttention(MegatronModule):
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
-            args.hidden_size,
+            self.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
@@ -634,9 +663,16 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
 
+        if layer_type == LayerType.mae_decoder:
+            self.hidden_size = args.decoder_embed_dim
+            self.ffn_hidden_size = args.decoder_ffn_size
+        else:
+            self.hidden_size = args.hidden_size
+            self.ffn_hidden_size = args.ffn_hidden_size
+
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
-            args.hidden_size,
+            self.hidden_size,
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
             sequence_parallel=args.sequence_parallel)
@@ -647,14 +683,16 @@ class ParallelTransformerLayer(MegatronModule):
             output_layer_init_method,
             layer_number,
             attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
+            attn_mask_type=self_attn_mask_type,
+            layer_type = layer_type
+            )
         self.hidden_dropout = args.hidden_dropout
         self.bias_dropout_fusion = args.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
         self.post_attention_layernorm = LayerNorm(
-            args.hidden_size,
+            self.hidden_size,
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
             sequence_parallel=args.sequence_parallel)
@@ -676,7 +714,7 @@ class ParallelTransformerLayer(MegatronModule):
         if args.num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
-            self.mlp = ParallelMLP(init_method, output_layer_init_method)
+            self.mlp = ParallelMLP(init_method, output_layer_init_method, layer_type)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -900,6 +938,13 @@ class ParallelTransformer(MegatronModule):
 
         self.sequence_parallel = args.sequence_parallel
 
+        if layer_type == LayerType.mae_decoder:
+            self.hidden_size = args.decoder_embed_dim
+            self.ffn_hidden_size = args.decoder_ffn_size
+        else:
+            self.hidden_size = args.hidden_size
+            self.ffn_hidden_size = args.ffn_hidden_size
+
         # Transformer Engine Init.
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
@@ -946,8 +991,8 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
                 return transformer_engine.pytorch.TransformerLayer(
-                    args.hidden_size,
-                    args.ffn_hidden_size,
+                    self.hidden_size,
+                    self.ffn_hidden_size,
                     args.num_attention_heads,
                     layernorm_epsilon=args.layernorm_epsilon,
                     hidden_dropout=args.hidden_dropout,
@@ -1023,7 +1068,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
-                args.hidden_size,
+                self.hidden_size,
                 eps=args.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,
                 sequence_parallel=args.sequence_parallel)

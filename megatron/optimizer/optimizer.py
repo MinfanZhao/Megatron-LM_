@@ -237,7 +237,7 @@ class MegatronOptimizer(ABC):
         """
         if mpu.is_rank_in_position_embedding_group() and \
                 mpu.get_pipeline_model_parallel_world_size() > 1 and \
-                args.pipeline_model_parallel_split_rank is not None:
+                args.pipeline_model_parallel_split_rank is not None and args.vision_pretraining == False:
             unwrapped_model = self.models[0]
             unwrapped_model = unwrap_model(
                 unwrapped_model, (torchDDP, LocalDDP, Float16Module))

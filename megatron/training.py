@@ -25,8 +25,8 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
+from megatron.model import ModelType
 from megatron.model import GPTModel
-from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -37,7 +37,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -113,7 +113,6 @@ def pretrain(train_valid_test_dataset_provider,
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
-
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
@@ -143,11 +142,6 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     iteration = 0
-
-    if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
-        args.train_iters = args.retro_cyclic_train_iters
-        print_rank_0("retro cyclic train iters : %d" % args.train_iters)
-
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, opt_param_scheduler,
@@ -400,7 +394,6 @@ def setup_model_and_optimizer(model_provider_func,
     return model, optimizer, opt_param_scheduler
 
 
-
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler):
     """Single training step."""
@@ -419,16 +412,8 @@ def train_step(forward_step_func, data_iterator,
     forward_backward_func = get_forward_backward_func()
     fwd_bwd_timers = timers if args.timing_log_level > 1 else None
     losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=get_num_microbatches(),
-        dtype=args.params_dtype,
-        tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
-        grad_scaler=optimizer.scale_loss,
-        sequence_parallel=args.sequence_parallel,
-        forward_only=False,
-        timers=fwd_bwd_timers)
+        forward_step_func, data_iterator, model,
+        optimizer, fwd_bwd_timers, forward_only=False)
     timers('forward-backward').stop()
 
     # Empty unused memory.
@@ -701,6 +686,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler)
+        print("after train_step")
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -708,6 +694,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
+        print('after optimizer')
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
@@ -716,6 +703,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+        print('after training_log')
 
         # Autoresume
         if args.adlr_autoresume and \
@@ -765,7 +753,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
-            if args.save and not saved_checkpoint:
+            if not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
             torch.distributed.barrier()
@@ -803,15 +791,8 @@ def evaluate(forward_step_func,
 
             forward_backward_func = get_forward_backward_func()
             loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=get_num_microbatches(),
-                dtype=args.params_dtype,
-                tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
-                sequence_parallel=args.sequence_parallel,
-                forward_only=True,
-                timers=None)
+                forward_step_func, data_iterator, model, optimizer=None,
+                timers=None, forward_only=True)
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -885,8 +866,7 @@ def cyclic_iter(iter):
         for x in iter:
             yield x
 
-
-def build_train_valid_test_data_loaders(
+def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
     """XXX"""
     args = get_args()
@@ -952,19 +932,6 @@ def build_train_valid_test_data_loaders(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
-
-    return train_dataloader, valid_dataloader, test_dataloader
-
-
-def build_train_valid_test_data_iterators(
-        build_train_valid_test_datasets_provider):
-
-    args = get_args()
-
-    # Build loaders.
-    train_dataloader, valid_dataloader, test_dataloader = \
-        build_train_valid_test_data_loaders(
-            build_train_valid_test_datasets_provider)
 
     # Build iterators.
     dl_type = args.dataloader_type

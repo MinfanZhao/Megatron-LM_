@@ -139,7 +139,6 @@ class MaskedAutoencoderViT(MegatronModule):
         super(MaskedAutoencoderViT, self).__init__(share_word_embeddings=False)
         args = get_args()
 
-        self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         if args.init_method_xavier_uniform:
             self.init_method = torch.nn.init.xavier_uniform_
             self.scaled_init_method = torch.nn.init.xavier_uniform_
@@ -162,7 +161,7 @@ class MaskedAutoencoderViT(MegatronModule):
         self.single_token_output = single_token_output
         self.drop_path_rate = drop_path_rate
 
-        self.in_chans = args.in_chans
+        self.in_chans = args.num_channels
         self.mask_ratio = args.mask_ratio # add to args
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
@@ -222,6 +221,7 @@ class MaskedAutoencoderViT(MegatronModule):
         ## decoder 
         if self.add_decoder:
             if self.pre_process:
+                self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
                 self.decoder_embed = torch.nn.Linear(self.hidden_size, self.decoder_embed_dim, bias=True)
                 self.mask_token = torch.nn.Parameter(torch.zeros(1, 1, self.decoder_embed_dim))
                 self.decoder_pos_embed = torch.nn.Embedding(self.seq_length, self.decoder_embed_dim) 
@@ -284,7 +284,7 @@ class MaskedAutoencoderViT(MegatronModule):
             assert len(input_tensor) == 3, \
                 'input_tensor should be length 3 for stage-1 with only decoder'
             self.encoder_output = input_tensor[0]
-            self.ids_restore = input_tensor[1]
+            self.ids_restore = input_tensor[1].long()
             self.mask = input_tensor[2]
         elif self.add_decoder:
             assert len(input_tensor) == 2, \
@@ -318,11 +318,10 @@ class MaskedAutoencoderViT(MegatronModule):
             # masking : s -> s * (1-mask_ratio)
             masked_output, mask, ids_restore = self.random_masking(pos_embedded, self.mask_ratio)
             concatenated_tokens = masked_output
+
             # append cls token
             if self.class_token:
-                self.cls_token = self.cls_token +  self.position_embeddings(self.position_ids[:, :1])
                 cls_tokens = self.cls_token.expand(masked_output.shape[0], -1, -1) # b, CLASS_TOKEN_LENGTH, hidden_size
-                
                 concatenated_tokens = torch.cat((cls_tokens, masked_output), dim=1)
 
             # [b, s, h] => [s, b, h]
@@ -346,12 +345,12 @@ class MaskedAutoencoderViT(MegatronModule):
         if self.add_decoder:
             if self.pre_process:
                 encoder_input = self.encoder_output #[s b h]
-
                 hidden_states = encoder_input.transpose(0,1).contiguous() # [b s h]
                 # embed tokens
                 x = self.decoder_embed(hidden_states)
 
                 # append mask tokens to sequence
+                
                 mask_tokens = self.mask_token.repeat(x.shape[0], self.ids_restore.shape[1] + 1 - x.shape[1], 1)
                 x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
                 x_ = torch.gather(x_, dim=1, index=self.ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
@@ -363,7 +362,7 @@ class MaskedAutoencoderViT(MegatronModule):
                 hidden_states = hidden_states.transpose(0,1).contiguous() # [s b h]
 
         
-            hidden_states = self.decoder(hidden_states)
+            hidden_states = self.decoder(hidden_states, None)
 
             if self.post_process :
                 hidden_states = self.decoder_pred(hidden_states)
@@ -374,6 +373,7 @@ class MaskedAutoencoderViT(MegatronModule):
                 # else:
                     
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
+                
             return hidden_states, self.mask
 
 

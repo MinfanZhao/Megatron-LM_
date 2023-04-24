@@ -211,8 +211,75 @@ class DinoTransform(object):
             crops.append(self.local_transform(image))
         return crops
 
+class MaeTransform(object):
+    def __init__(self, image_size, train=True, transform=None):
+        args = get_args()
+        assert args.fp16 or args.bf16
+        self.data_type = torch.half if args.fp16 else torch.bfloat16
+        from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+        mean = args.mean if args.mean is not None else  IMAGENET_DEFAULT_MEAN 
+        std = args.std if args.std is not None else IMAGENET_DEFAULT_STD
+        if train:
+            from timm.data import create_transform
+            if transform is None:
+                transform = create_transform(
+                    input_size=image_size,
+                    is_training=True,
+                    color_jitter=args.color_jitter,
+                    auto_augment=args.aa,
+                    interpolation='bicubic',
+                    re_prob=args.reprob,
+                    re_mode=args.remode,
+                    re_count=args.recount,
+                    mean=mean,
+                    std=std,
+                    )
+            self.transform = T.Compose([
+                transform,
+                T.ConvertImageDtype(self.data_type)
+            ])
+        else:
+            t = []
+            assert args.img_h == args.img_w, "img_h should equal with img_w"
+            if args.img_h <= 224:
+                crop_pct = 224 / 256
+            else:
+                crop_pct = 1.0
+            size = int(args.img_h / crop_pct)
+            t.append(
+                T.Resize(size, interpolation=Image.BICUBIC),  # to maintain same ratio w.r.t. 224 images
+            )
+            t.append(T.CenterCrop(args.img_h))
+
+            t.append(T.ToTensor())
+            t.append(T.Normalize(mean, std))
+            t.append(T.ConvertImageDtype(self.data_type))
+            self.transform = T.Compose(t)
+
+    def __call__(self, input):
+        output = self.transform(input)
+        return output
+
+def build_pretrain_datasets(data_path, image_size = 224, transform=None):
+    '''
+    for mae pretrain
+    '''
+    args = get_args()
+    train_transform =  MaeTransform(image_size,train=True,transform=transform)
+    train_data_path = data_path[0] 
+    train_data = ImageFolder(
+        root=train_data_path,
+        transform=train_transform,
+        classes_fraction=args.classes_fraction,
+        data_per_class_fraction=args.data_per_class_fraction
+    )
+    train_data = RandomSeedDataset(train_data)
+    return train_data
+
+
 
 def build_train_valid_datasets(data_path, image_size=224):
+    
     args = get_args()
 
     if args.vision_pretraining_type == 'classify':
@@ -224,6 +291,9 @@ def build_train_valid_datasets(data_path, image_size=224):
     elif args.vision_pretraining_type == 'dino':
         train_transform = DinoTransform(image_size, train=True)
         val_transform = ClassificationTransform(image_size, train=False)
+    elif args.vision_pretraining_type == 'mae':
+        train_transform = MaeTransform(image_size)
+        val_transform = MaeTransform(image_size, train=False)
     else:
         raise Exception('{} vit pretraining type is not supported.'.format(
                 args.vit_pretraining_type))
