@@ -353,6 +353,7 @@ class TransformerLanguageModel(MegatronModule):
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
+        self.rope_style = args.rope_style
 
         # Embeddings.
         if self.pre_process:
@@ -378,7 +379,7 @@ class TransformerLanguageModel(MegatronModule):
             # partial rotary embeddings, which is better than full rotary
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, self.rope_style)
 
         # Retriever (bi-directional transformer with cross attention)
         if args.retro_add_retriever:
@@ -442,7 +443,9 @@ class TransformerLanguageModel(MegatronModule):
                     args.hidden_size,
                     args.padded_vocab_size,
                     bias=False, # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
-                    init_method=self.init_method)
+                    init_method=self.init_method,
+                    use_cpu_initialization=args.use_cpu_initialization,
+                    perform_initialization=args.perform_initialization)
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):
@@ -519,7 +522,8 @@ class TransformerLanguageModel(MegatronModule):
                         encoder_input,
                         enc_attn_mask,
                         inference_params=inference_params,
-                        rotary_pos_emb=rotary_pos_emb)
+                        rotary_pos_emb=rotary_pos_emb,
+                        rope_style=self.rope_style)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -553,7 +557,8 @@ class TransformerLanguageModel(MegatronModule):
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
             inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb)
+            rotary_pos_emb=rotary_pos_emb,
+            rope_style=self.rope_style)
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output

@@ -12,22 +12,29 @@ from torch import einsum, nn
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, rope_style="megatron"):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
+        self.rope_style=rope_style
 
     def forward(self, max_seq_len, offset=0):
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
         freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
-        emb = torch.cat((freqs, freqs), dim=-1)
+        if self.rope_style == "megatron":
+            emb = torch.cat((freqs, freqs), dim=-1)
+        elif self.rope_style == "llama":
+            emb = torch.stack([freqs, freqs],dim=-1).flatten(-2)
+        else:
+            raise ValueError("Unknown rope style error.")
         # emb [seq_length, .., dim]
         from einops import rearrange
         return rearrange(emb, 'n d -> n 1 1 d')
+
 
 
 def _rotate_half(x):
@@ -39,8 +46,16 @@ def _rotate_half(x):
     x1, x2 = x.unbind(dim=-2)
     return torch.cat((-x2, x1), dim=-1)
 
+def _rotate_half_llama(x):
+    """
+    change sign so the last dimension becomes [-odd, +even]
+    """
+    from einops import rearrange
+    x = rearrange(x, '... (j d) -> ... j d', d=2)
+    x1, x2 = x.unbind(dim=-1)
+    return torch.stack((-x2, x1), dim=-2).transpose(-1,-2).flatten(-2)
 
-def apply_rotary_pos_emb(t, freqs):
+def apply_rotary_pos_emb(t, freqs, rope_style='megatron'):
     """
     input tensor t is of shape [seq_length, ..., dim]
     rotary positional embeding tensor freqs is of shape [seq_length, ..., dim]
@@ -52,5 +67,14 @@ def apply_rotary_pos_emb(t, freqs):
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+    if rope_style == 'megatron':
+        t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+    elif rope_style == 'llama':
+        t = (t * freqs.cos()) + (_rotate_half_llama(t) * freqs.sin())
+    else:
+        raise ValueError("Unknown rope style error.") 
     return torch.cat((t, t_pass), dim=-1)
+    
+    
+
+
