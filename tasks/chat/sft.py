@@ -41,7 +41,6 @@ def get_batch(batch):
         batch = next(batch)
     # Items and their type.
     keys = list(batch.keys())
-    print(type(batch), keys)
     
     datatype = torch.int64
 
