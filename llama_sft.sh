@@ -18,7 +18,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
 echo "distributed args: $DISTRIBUTED_ARGS"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-LOAD_CHECKPOINT_PATH=./checkpoints/test_llama_nopip/
+LOAD_CHECKPOINT_PATH=./checkpoints/chinese-llama-7B-p2t2/
 SAVE_CHECKPOINT_PATH=./checkpoints/test_sft/
 TENSORBOARD_PATH=./tensorboard/test_sft/$DATETIME
 
@@ -28,38 +28,45 @@ MODEL_ARGS="--num-layers 32 \
         --num-attention-heads 32 \
         --seq-length 2048"
 
+# LLAMA_ARGS="--use-rmsnorm \
+#         --swiglu \
+#         --llama-swiglu \
+#         --rope-style llama"
 LLAMA_ARGS="--use-rmsnorm \
         --swiglu \
         --llama-swiglu \
-        --rope-style llama"
+        --rope-style llama \
+        --no-query-key-layer-scaling \
+        --no-position-embedding \
+        --use-rotary-position-embeddings \
+        --disable-bias-linear \
+        --untie-embeddings-and-output-weights"
 
 TRAIN_ARGS="--max-position-embeddings 2048 \
         --lr-decay-samples 258560 \
         --lr 1.0e-04 \
         --min-lr 1.0e-05 \
         --lr-decay-style cosine \
-        --micro-batch-size 4 \
-        --global-batch-size 4 \
+        --micro-batch-size 2 \
+        --global-batch-size 4"
 
 OUTPUT_ARGS="--log-interval 1 \
         --eval-iters -1 \
         --save-interval 300"
 
-TOKENIZER_MODEL="./llama_tokenizer.model"
-# DATA_PATH="/staff/zzq/dataset/nlp/Yuan_Processed/001.txt_document_context"
-DATA_PATH="/home/nfs/zzq/data/asc/001.txt_document_context"
-
+TOKENIZER_MODEL="./checkpoints/chinese-llama/7B/tokenizer.model"
+# /staff/wangzhaohui/codes/Megatron-LM_/checkpoints/test_llama_nopip
 CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         ./tasks/main.py \
         --task LLAMA_SFT \
         --finetune \
         --epochs 50 \
-        --pretrained-checkpoint /staff/wangzhaohui/codes/Megatron-LM_/checkpoints/test_llama_nopip \
-        --tokenizer-type SentencePieceTokenizer \
+        --pretrained-checkpoint $LOAD_CHECKPOINT_PATH \
+        --tokenizer-type LLaMASentencePieceTokenizer \
         --tokenizer-model $TOKENIZER_MODEL \
-        --tensor-model-parallel-size 8 \
-        --pipeline-model-parallel-size 1 \
+        --tensor-model-parallel-size 2 \
+        --pipeline-model-parallel-size 2 \
         $MODEL_ARGS \
         $LLAMA_ARGS \
         $TRAIN_ARGS \
@@ -80,6 +87,16 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --log-params-norm \
         --tensorboard-dir $TENSORBOARD_PATH \
         --tensorboard-log-interval 1 \
+        --use-flash-attn \
+        --no-load-optim \
+        --no-load-rng \
+        --finetune \
+        --eval-interval 30 \
+        --eval-iters 70 \
+        --make-vocab-size-divisible-by 1 \
+        --attention-dropout 0.0 \
+        --hidden-dropout 0.0 \
+        --initial-loss-scale 32768.0
         # --use-distributed-optimizer \
         # --use-flash-attn \
         # --no-gradient-accumulation-fusion \

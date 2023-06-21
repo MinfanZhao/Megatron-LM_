@@ -4,7 +4,7 @@
 
 from random import shuffle
 import torch
-from torch.utils.data import Subset
+from torch.utils.data import Subset, DataLoader
 from functools import partial
 from megatron import get_args
 from megatron import print_rank_0
@@ -37,11 +37,12 @@ def model_provider(pre_process=True, post_process=True):
 
 def get_batch(batch):
     """Generate a batch"""
-    args = get_args()
-    tokenizer = get_tokenizer()
-
+    if not isinstance(batch, dict):
+        batch = next(batch)
     # Items and their type.
     keys = list(batch.keys())
+    print(type(batch), keys)
+    
     datatype = torch.int64
 
     data_b = tensor_parallel.broadcast_data(keys, batch, datatype)
@@ -107,5 +108,5 @@ if __name__ == "__main__":
     pretrain(train_valid_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'SentencePieceTokenizer'}
+             args_defaults={'tokenizer_type': 'LLaMASentencePieceTokenizer'}
     )
