@@ -6,3 +6,5 @@ build
 *~
 tensorboard
 checkpoints
+backup
+data
