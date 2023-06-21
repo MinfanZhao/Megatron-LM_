@@ -71,7 +71,16 @@ class Encoder(object):
             text = data[key]
             doc_ids = []
             for sentence in Encoder.splitter.tokenize(text):
+                
                 sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                # print(sentence_ids)
+                # print('############################################################################')
+                if self.args.append_bos:
+                    sentence_ids.insert(0, Encoder.tokenizer.bos)
+                if self.args.append_eos:
+                    sentence_ids.append(Encoder.tokenizer.eos)
+                # print(sentence_ids)
+                # print('============================================================================')
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
             if len(doc_ids) > 0 and self.args.append_eod:
@@ -94,12 +103,18 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'SentencePieceTokenizer', 'GPTSentencePieceTokenizer'],
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer', 
+                                'GPTSentencePieceTokenizer', 'NullTokenizer',
+                                'LLaMASentencePieceTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file (if necessary).')
+    group.add_argument('--append-bos', action='store_true',
+                       help='Append an <s> token to the begin of a sentence.')
+    group.add_argument('--append-eos', action='store_true',
+                       help='Append an </s> token to the end of a sentence.')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
@@ -130,7 +145,7 @@ def get_args():
 
     # some default/dummy values for the tokenizer
     args.rank = 0
-    args.make_vocab_size_divisible_by = 128
+    args.make_vocab_size_divisible_by = 1#128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
 

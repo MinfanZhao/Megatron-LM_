@@ -13,7 +13,7 @@ from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import LLaMAModel
 from megatron.training import pretrain
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import get_ltor_masks_and_position_ids, get_ltor_masks_and_position_ids_without_eod
 from megatron.utils import average_losses_across_data_parallel_group
 
 def model_provider(pre_process=True, post_process=True):
@@ -49,14 +49,9 @@ def get_batch(data_iterator):
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
-
     # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
+    attention_mask, loss_mask, position_ids = \
+        get_ltor_masks_and_position_ids_without_eod(tokens, mask_type='megatron')
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
@@ -115,5 +110,5 @@ if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'SentencePieceTokenizer'}
+             args_defaults={'tokenizer_type': 'LLaMASentencePieceTokenizer'}
     )

@@ -35,6 +35,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_llama_args(parser)
+    
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -555,11 +557,7 @@ def _add_network_size_args(parser):
     group.add_argument('--apply-layernorm-1p', action='store_true',
                        help='Adjust LayerNorm weights such that they are centered '
                        'around zero. This improves numerical stability.')
-    group.add_argument('--use-rmsnorm', action='store_true', 
-                       help='Replace Layernorm with RMSNorm. '
-                       'RMSNorm should be used if and only if training LLaMA LLM.')
-    group.add_argument('--rmsnorm-epsilon', type=float, default=1e-5,
-                       help='RMS norm epsilon.')
+    
     # deprecated
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
@@ -577,8 +575,7 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
-    group.add_argument('--llama-swiglu', action='store_true',
-                       help='Use gated linear units and SiLU activation instead of default gelu with llama setting')
+    
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
@@ -1100,6 +1097,7 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'LLaMASentencePieceTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
@@ -1253,4 +1251,16 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
+    return parser
+
+
+def _add_llama_args(parser):
+    group = parser.add_argument_group(title="llama")
+    group.add_argument('--llama-swiglu', action='store_true',
+                       help='Use gated linear units and SiLU activation instead of default gelu with llama setting')
+    group.add_argument('--use-rmsnorm', action='store_true', 
+                       help='Replace Layernorm with RMSNorm. '
+                       'RMSNorm should be used if and only if training LLaMA LLM.')
+    group.add_argument('--rmsnorm-epsilon', type=float, default=1e-6,
+                       help='RMS norm epsilon.')
     return parser

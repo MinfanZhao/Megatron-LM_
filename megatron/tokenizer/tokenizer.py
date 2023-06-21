@@ -33,9 +33,15 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
+    elif args.tokenizer_type == 'LLaMASentencePieceTokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = _LLaMASentencePieceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'NullTokenizer':
+        assert args.vocab_size is not None
+        tokenizer = _NullTokenizer(args.vocab_size)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -318,6 +324,7 @@ class _SentencePieceTokenizer(AbstractTokenizer):
                 next_id = len(self._vocab)
                 self._vocab[t] = next_id
                 self._inv_vocab[next_id] = t
+                print(f"add special token {t}")
             self._special_tokens[t] = self._vocab[t]
             self._inv_special_tokens[self._vocab[t]] = t
 
@@ -462,6 +469,78 @@ class _SentencePieceTokenizer(AbstractTokenizer):
 
 
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
+    """SentencePieceTokenizer-Megatron wrapper"""
+
+    def __init__(self, model_file,):
+        super().__init__(model_file, vocab_extra_ids=0)
+
+    def _initalize(self, vocab_extra_ids):
+        self._populate_vocab()
+
+        self._pad_id = self.tokenizer.pad_id()
+        self._bos_id = self.tokenizer.bos_id()
+        self._eos_id = self.tokenizer.eos_id()
+
+    def tokenize(self, text):
+        return self.tokenizer.encode_as_ids(text)
+
+    def detokenize(self, ids):
+        return self.tokenizer.decode_ids(ids)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+class _NullTokenizer:
+    def __init__(self, vocab_size):
+        vocab_size = int(vocab_size)
+        self._eos_id = vocab_size
+        self.vocab_size = vocab_size+1
+
+    def tokenize(self, text):
+        return [int(x) for x in text.split(' ')]
+
+    def detokenize(self, ids):
+        text = [str(x) for x in ids]
+        return ' '.join(text)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+class _LLaMASentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
     def __init__(self, model_file,):
