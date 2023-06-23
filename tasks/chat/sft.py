@@ -49,10 +49,10 @@ def get_batch(batch):
     # Unpack.
     tokens = data_b['input_ids'][:,:-1].long()
     labels = data_b['labels'][:,1:].long()    
-
+    
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = build_attn_mask_and_position_ids_with_padding(data_b['attention_mask'][:,:-1], tokens.device)
-
+    loss_mask[labels==-100] = 0.0
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 def loss_func(loss_mask, output_tensor):
@@ -89,8 +89,8 @@ def train_valid_datasets_provider():
     print_rank_0('> building train, validation, and test datasets '
                  'for SFT ...')
     
-    train_ds = KXDigitDataset(args.test_data_path[0])
-    valid_ds = KXDigitDataset(args.test_data_path[0])
+    train_ds = KXDigitDataset(args.train_data_path[0], args.seq_length)
+    valid_ds = KXDigitDataset(args.test_data_path[0], args.seq_length)
     
     print_rank_0("> finished creating SFT datasets ...")
 

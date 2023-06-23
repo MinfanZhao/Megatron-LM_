@@ -59,18 +59,19 @@ def build_attn_mask_and_position_ids_with_padding(masks, device):
 
 
 class KXDigitDataset(Dataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path, seq_length=1024):
         self.data_list = self.read_json(data_path)
-        
+        assert seq_length >= 1024
+        self.padding_length = seq_length - 1024
     
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
         sample = self.data_list[idx]
-        sample['labels'] = [-100]*1024 + sample['labels']
-        sample['input_ids'] = [0]*1024 + sample['input_ids']
-        sample['attention_mask'] = [0]*1024 + sample['attention_mask']
+        sample['labels'] = [-100]*self.padding_length + sample['labels']
+        sample['input_ids'] = [0]*self.padding_length + sample['input_ids']
+        sample['attention_mask'] = [0]*self.padding_length + sample['attention_mask']
         sample = dict((k, torch.tensor(v)) for k, v in sample.items())
         return sample
             
