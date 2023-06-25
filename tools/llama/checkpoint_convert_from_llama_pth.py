@@ -121,8 +121,13 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
             ]
         
         print("############## loaded ####################")
-        for key, value in loaded.items():
-            print(key, value.shape)
+        if model_size == "7B":
+            for key, value in loaded.items():
+                print(key, value.shape)
+        else:
+            for shard_load in loaded:
+                for key, value in shard_load.items():
+                    print(key, value.shape)
         
         return loaded
     
@@ -208,8 +213,7 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
                         ).reshape(dim, dim),
                         n_heads, dims_per_head, dim)
                 megatron_state_dict['encoder'][f"layers.{layer_i}.self_attention.dense.weight"] = torch.cat(
-                    [llama_state_dict[i][f"layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=1
-                ), 
+                    [llama_state_dict[i][f"layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=1)
                 megatron_state_dict['encoder'][f"layers.{layer_i}.post_attention_rmsnorm.weight"] = \
                     llama_state_dict[0][f"layers.{layer_i}.ffn_norm.weight"]
                 megatron_state_dict['encoder'][f"layers.{layer_i}.mlp.dense_h_to_4h.weight"] = \
@@ -231,19 +235,23 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
             megatron_state_dict['embedding']['word_embeddings']['weight'] = llama_state_dict["tok_embeddings.weight"]
             megatron_state_dict['output_layer']['weight'] = llama_state_dict["output.weight"]
         else:
-            megatron_state_dict['encoder']["final_rmsnorm.weight"]: llama_state_dict[0]["norm.weight"]
+            megatron_state_dict['encoder']["final_rmsnorm.weight"] = llama_state_dict[0]["norm.weight"]
             megatron_state_dict['embedding']['word_embeddings']['weight'] = \
                 torch.cat([llama_state_dict[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=1)
             megatron_state_dict['output_layer']['weight'] = \
-                torch.cat([llama_state_dict[i]["output.weight"] for i in range(num_shards)], dim=1)
+                torch.cat([llama_state_dict[i]["output.weight"] for i in range(num_shards)], dim=0)
             
             
             
-        print("############### state dict ###################")
+        print("############### state dict encoder ###################")
         for key, value in megatron_state_dict['encoder'].items():
             print(key, value.shape)
+        print("############### state dict embedding ###################")
         for key, value in megatron_state_dict['embedding']['word_embeddings'].items():
             print(key, value.shape)
+        for key, value in megatron_state_dict['output_layer'].items():
+            print(key, value.shape)
+        print("############### end state dict ###################")
             
         return megatron_state_dict
     
@@ -303,7 +311,9 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
                 output_layer = whole_state_dict['output_layer']['weight']
                 splited_output_layer = output_layer.view(tensor_size, -1 ,output_layer.shape[1])[tensor_rank,:,:]
                 splited_state_dict['output_layer'] = {'weight':splited_output_layer}
-                
+                # print('show keys:')
+                # print(whole_state_dict['encoder'].keys())
+                # print(splited_state_dict['encoder'].keys())
                 splited_state_dict['encoder']["final_rmsnorm.weight"] = whole_state_dict['encoder']["final_rmsnorm.weight"]
             
             print(tensor_rank, pipeline_rank, splited_state_dict['encoder'].keys())
@@ -359,27 +369,7 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
     tracker_filename = os.path.join(new_model_base, 'latest_checkpointed_iteration.txt')
     with open(tracker_filename, 'w') as f:
         f.write('release')    
-    # model = {
-    #     'args': None,
-    #     'checkpoint_version': '3.0',
-    #     'iteration': 0,
-    #     'model':{},
-    #     'rng_state': None
-    # }
-    # megatron_state_dict['model']['language_model'] = llama_to_megatron_state_dict
-    # filename = 'model_optim_rng.pt'
-    # print("start saving")
-    # torch.save(megatron_state_dict, os.path.join(new_model_base, filename))
 
-
-
-
-def write_tokenizer(tokenizer_path, input_tokenizer_path):
-    # Initialize the tokenizer based on the `spm` model
-    tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    print(f"Saving a {tokenizer_class.__name__} to {tokenizer_path}.")
-    tokenizer = tokenizer_class(input_tokenizer_path)
-    tokenizer.save_pretrained(tokenizer_path)
 
 
 def fix_attention_weight(wq, wk, wv, n_heads, dims_per_head, dim):
@@ -406,7 +396,7 @@ def main():
     # )
     parser.add_argument(
         "--model_size", default="7B",
-        choices=["7B", "13B", "30B", "65B", "tokenizer_only"],
+        choices=["7B", "13B", "30B", "65B"],
     )
     parser.add_argument(
         "--output_dir", default="./checkpoints/llama-7B-p1t4/",
@@ -427,8 +417,6 @@ def main():
             tensor_size=args.tensor_size,
             pipeline_size=args.pipeline_size,
         )
-    # spm_path = os.path.join(args.input_dir, "tokenizer.model")
-    # write_tokenizer(args.output_dir, spm_path)
 
 
 if __name__ == "__main__":

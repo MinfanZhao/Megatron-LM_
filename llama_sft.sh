@@ -30,10 +30,6 @@ MODEL_ARGS="--num-layers 32 \
         --seq-length 1024 \
         --max-position-embeddings 1024"
 
-# LLAMA_ARGS="--use-rmsnorm \
-#         --swiglu \
-#         --llama-swiglu \
-#         --rope-style llama"
 LLAMA_ARGS="--use-rmsnorm \
         --swiglu \
         --llama-swiglu \
@@ -56,7 +52,9 @@ OUTPUT_ARGS="--log-interval 1 \
         --save-interval 3000"
 
 TOKENIZER_MODEL="./checkpoints/chinese-llama/7B/tokenizer.model"
-# /staff/wangzhaohui/codes/Megatron-LM_/checkpoints/test_llama_nopip
+TRAIN_DATA_PATH=/staff/zzq/dataset/nlp/for_sw/train_data_for_SW_token_ids.json
+TEST_DATA_PATH=/staff/zzq/dataset/nlp/for_sw/test_data_for_SW_token_ids.json
+
 CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         ./tasks/main.py \
@@ -72,8 +70,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         $LLAMA_ARGS \
         $TRAIN_ARGS \
         $OUTPUT_ARGS \
-        --train-data-path /staff/zzq/dataset/nlp/for_sw/train_data_for_SW_token_ids.json \
-        --test-data-path /staff/zzq/dataset/nlp/for_sw/test_data_for_SW_token_ids.json \
+        --train-data-path  $TRAIN_DATA_PATH \
+        --test-data-path $TEST_DATA_PATH \
         --split 100,0,0 \
         --clip-grad 1.0 \
         --weight-decay 0.0 \
@@ -102,5 +100,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         # --no-gradient-accumulation-fusion \
         # --sequence-parallel \
         # --checkpoint-num-layers 1 \
-        # --encoder-attn-mask-type padding \
         # --checkpoint-activations \
