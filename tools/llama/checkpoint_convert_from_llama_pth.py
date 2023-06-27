@@ -147,17 +147,17 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
         
         for layer_i in range(n_layers):
             if model_size == "7B":
-                print(f'{layer_i} input_rms : {llama_state_dict[f"layers.{layer_i}.attention_norm.weight"][:20]}')
-                print(f'{layer_i} wq : {llama_state_dict[f"layers.{layer_i}.attention.wq.weight"][0,:20]}')
-                print(f'{layer_i} wk : {llama_state_dict[f"layers.{layer_i}.attention.wk.weight"][0,:20]}')
-                print(f'{layer_i} wv : {llama_state_dict[f"layers.{layer_i}.attention.wv.weight"][0,:20]}')
-                print(f'{layer_i} wo : {llama_state_dict[f"layers.{layer_i}.attention.wo.weight"][0,:20]}')
-                print(f'{layer_i} post_attn_rms : {llama_state_dict[f"layers.{layer_i}.ffn_norm.weight"][:20]}')
+                # print(f'{layer_i} input_rms : {llama_state_dict[f"layers.{layer_i}.attention_norm.weight"][:20]}')
+                # print(f'{layer_i} wq : {llama_state_dict[f"layers.{layer_i}.attention.wq.weight"][0,:20]}')
+                # print(f'{layer_i} wk : {llama_state_dict[f"layers.{layer_i}.attention.wk.weight"][0,:20]}')
+                # print(f'{layer_i} wv : {llama_state_dict[f"layers.{layer_i}.attention.wv.weight"][0,:20]}')
+                # print(f'{layer_i} wo : {llama_state_dict[f"layers.{layer_i}.attention.wo.weight"][0,:20]}')
+                # print(f'{layer_i} post_attn_rms : {llama_state_dict[f"layers.{layer_i}.ffn_norm.weight"][:20]}')
                 
                 
-                print(f'{layer_i} w1 {llama_state_dict[f"layers.{layer_i}.feed_forward.w1.weight"][0,:20]}')
-                print(f'{layer_i} w3 {llama_state_dict[f"layers.{layer_i}.feed_forward.w3.weight"][0,:20]}')
-                print(f'{layer_i} w2 {llama_state_dict[f"layers.{layer_i}.feed_forward.w2.weight"][0,:20]}')
+                # print(f'{layer_i} w1 {llama_state_dict[f"layers.{layer_i}.feed_forward.w1.weight"][0,:20]}')
+                # print(f'{layer_i} w3 {llama_state_dict[f"layers.{layer_i}.feed_forward.w3.weight"][0,:20]}')
+                # print(f'{layer_i} w2 {llama_state_dict[f"layers.{layer_i}.feed_forward.w2.weight"][0,:20]}')
                 
                 # Unsharded
                 megatron_state_dict['encoder'][f"layers.{layer_i}.input_rmsnorm.weight"] = \
@@ -316,9 +316,15 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
                 # print(splited_state_dict['encoder'].keys())
                 splited_state_dict['encoder']["final_rmsnorm.weight"] = whole_state_dict['encoder']["final_rmsnorm.weight"]
             
-            print(tensor_rank, pipeline_rank, splited_state_dict['encoder'].keys())
+            # print(tensor_rank, pipeline_rank, splited_state_dict['encoder'].keys())
             for key in splited_state_dict['encoder'].keys():
                 print(key, splited_state_dict['encoder'][key].shape)
+            if is_first_stage:
+                for key, value in splited_state_dict['embedding']['word_embeddings'].items():
+                    print(key, value.shape)
+            if is_last_stage:
+                for key, value in splited_state_dict['output_layer'].items():
+                    print(key, value.shape)
             
             
             return splited_state_dict
@@ -368,7 +374,7 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
     
     tracker_filename = os.path.join(new_model_base, 'latest_checkpointed_iteration.txt')
     with open(tracker_filename, 'w') as f:
-        f.write('release')    
+        f.write('release')
 
 
 
@@ -409,14 +415,13 @@ def main():
         "--tensor_size", default="4", type=int
     )
     args = parser.parse_args()
-    if args.model_size != "tokenizer_only":
-        convert_model(
-            new_model_base=args.output_dir,
-            llama_model_path=os.path.join(args.input_dir, args.model_size),
-            model_size=args.model_size,
-            tensor_size=args.tensor_size,
-            pipeline_size=args.pipeline_size,
-        )
+    convert_model(
+        new_model_base=args.output_dir,
+        llama_model_path=os.path.join(args.input_dir, args.model_size),
+        model_size=args.model_size,
+        tensor_size=args.tensor_size,
+        pipeline_size=args.pipeline_size,
+    )
 
 
 if __name__ == "__main__":

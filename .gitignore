@@ -5,6 +5,7 @@ build
 *.egg-info
 *~
 tensorboard
-checkpoints
 backup
+checkpoints
 data
+script
