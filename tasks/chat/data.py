@@ -59,10 +59,10 @@ def build_attn_mask_and_position_ids_with_padding(masks, device):
 
 
 class KXDigitDataset(Dataset):
-    def __init__(self, data_path, seq_length=1024):
+    def __init__(self, data_path, seq_length=1024, data_length=1024):
         self.data_list = self.read_json(data_path)
-        assert seq_length >= 1024
-        self.padding_length = seq_length - 1024
+        assert seq_length >= data_length
+        self.padding_length = seq_length - data_length
     
     def __len__(self):
         return len(self.data_list)

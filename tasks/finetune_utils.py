@@ -186,6 +186,9 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
+            args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                       args.micro_batch_size * \
+                                       get_num_microbatches()
 
             # Logging.
             params_norm = None

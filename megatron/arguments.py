@@ -1263,4 +1263,6 @@ def _add_llama_args(parser):
                        'RMSNorm should be used if and only if training LLaMA LLM.')
     group.add_argument('--rmsnorm-epsilon', type=float, default=1e-6,
                        help='RMS norm epsilon.')
+    group.add_argument('--data-length', type=int, default=1024,
+                       help='Length of  each input in the dataset.')
     return parser
