@@ -113,7 +113,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
                                          args.num_workers, not args.keep_last,
                                          task_collate_fn)
     # Set the training iterations.
-    args.train_iters_per_epoch = len(train_dataloader)
+    args.train_iters_per_epoch = len(train_dataloader) // get_num_microbatches()
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
