@@ -35,17 +35,19 @@ def model_provider(pre_process=True, post_process=True):
     return model
 
 
-def get_batch(batch):
+def get_batch(data_iterator):
     """Generate a batch"""
-    if not isinstance(batch, dict):
-        batch = next(batch)
-    # Items and their type.
-    keys = list(batch.keys())
     
+    if data_iterator is not None:
+        batch = next(data_iterator)
+    else:
+        batch = None
+    # Items and their type.
     datatype = torch.int64
-
+    keys = ['input_ids', 'attention_mask', 'labels']
+    
     data_b = tensor_parallel.broadcast_data(keys, batch, datatype)
-
+    
     # Unpack.
     tokens = data_b['input_ids'][:,:-1].long()
     labels = data_b['labels'][:,1:].long()    
