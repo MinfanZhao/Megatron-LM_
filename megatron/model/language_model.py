@@ -521,6 +521,7 @@ class TransformerLanguageModel(MegatronModule):
                     encoder_output = self.encoder(
                         encoder_input,
                         enc_attn_mask,
+                        enc_position_ids, 
                         inference_params=inference_params,
                         rotary_pos_emb=rotary_pos_emb,
                         rope_style=self.rope_style)

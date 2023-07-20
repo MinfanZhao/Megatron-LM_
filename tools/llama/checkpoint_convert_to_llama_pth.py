@@ -193,11 +193,14 @@ def fix_swiglu_weight_to_llama(swiglu_weight):
 
 
 def convert_model(new_model_base, megatron_model_base, model_size, tensor_parallel_size, pipeline_parallel_size):
-    os.makedirs(new_model_base, exist_ok=True)
+    # os.makedirs(new_model_base, exist_ok=True)
     megatron_state_dict = combine_from_split_weight(megatron_model_base, model_size, tensor_parallel_size, pipeline_parallel_size)
     llama_state_dict = convert_to_llama_state_dict(megatron_state_dict, model_size)
     if model_size == '7B':
-        torch.save(llama_state_dict, os.path.join(new_model_base,model_size,'consolidated.00.pth'))
+        new_model_base = os.path.join(new_model_base,model_size)
+        os.makedirs(new_model_base, exist_ok=True)
+        print(f"make dir path:{new_model_base}")
+        torch.save(llama_state_dict, os.path.join(new_model_base, 'consolidated.00.pth'))
     
 
 

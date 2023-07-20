@@ -55,7 +55,7 @@ def _rotate_half_llama(x):
     x1, x2 = x.unbind(dim=-1)
     return torch.stack((-x2, x1), dim=-2).transpose(-1,-2).flatten(-2)
 
-def apply_rotary_pos_emb(t, freqs, rope_style='megatron'):
+def apply_rotary_pos_emb(t, freqs, rope_style='megatron', position_ids=None):
     """
     input tensor t is of shape [seq_length, ..., dim]
     rotary positional embeding tensor freqs is of shape [seq_length, ..., dim]
@@ -64,17 +64,32 @@ def apply_rotary_pos_emb(t, freqs, rope_style='megatron'):
     rot_dim = freqs.shape[-1]
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-
+    
+    if position_ids is not None:
+        cos_part = freqs.cos().squeeze(2).squeeze(1)
+        sin_part = freqs.sin().squeeze(2).squeeze(1)
+        cos_part = cos_part[position_ids].transpose(0,1).unsqueeze(2)
+        sin_part = sin_part[position_ids].transpose(0,1).unsqueeze(2)
+    
+    else:
+        cos_part = freqs.cos()
+        sin_part = freqs.sin()
+        
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
     if rope_style == 'megatron':
-        t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+        t = (t * cos_part) + (_rotate_half(t) * sin_part)
     elif rope_style == 'llama':
-        t = (t * freqs.cos()) + (_rotate_half_llama(t) * freqs.sin())
+        t = (t * cos_part) + (_rotate_half_llama(t) * sin_part)
     else:
         raise ValueError("Unknown rope style error.") 
     return torch.cat((t, t_pass), dim=-1)
     
     
 
-
+if __name__ == "__main__":
+    hidden_size = 4096
+    num_attention_heads = 32
+    dim = hidden_size // num_attention_heads
+    rope = RotaryEmbedding(dim, rope_style='llama')
+    

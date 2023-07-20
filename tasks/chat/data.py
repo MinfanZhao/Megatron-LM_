@@ -4,8 +4,8 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import json
 
 
-from megatron.core import mpu
-from megatron import get_args
+# from megatron.core import mpu
+# from megatron import get_args
 
 
 class FakeDataSet(Dataset):
@@ -27,12 +27,22 @@ def get_first_valid_pos(mask):
         if value == 1:
             break
     return pos
+
+
+def get_last_valid_pos(mask, first_valid_pos):
+    pos = first_valid_pos
+    for pos, value in enumerate(mask[first_valid_pos:], start=first_valid_pos):
+        if value == 0:
+            return pos - 1
+    return pos
+        
         
     
 def build_attn_mask_and_position_ids_with_padding(masks, device):
     att_mask_batch, seq_length = masks.size()
     
-    first_valid_pos = [get_first_valid_pos(m) for m in masks]    
+    first_valid_pos = [get_first_valid_pos(m) for m in masks]
+    last_valid_pos = [get_last_valid_pos(m, f) for m, f in zip(masks, first_valid_pos)]
     
     attention_mask = torch.tril(torch.ones(
         (att_mask_batch, seq_length, seq_length), device=device)).view(
@@ -48,8 +58,12 @@ def build_attn_mask_and_position_ids_with_padding(masks, device):
     
     for b in range(att_mask_batch):
         p = first_valid_pos[b]
+        l = last_valid_pos[b]
         attention_mask[b, 0, :p,:] = 0
         attention_mask[b, 0, :,:p] = 0
+        attention_mask[b, 0, l+1:,:] = 0
+        attention_mask[b, 0, :,l+1:] = 0
+
         position_ids[b] -= p
         
     position_ids = position_ids.clamp(min=0)    
@@ -59,19 +73,26 @@ def build_attn_mask_and_position_ids_with_padding(masks, device):
 
 
 class KXDigitDataset(Dataset):
-    def __init__(self, data_path, seq_length=1024, data_length=1024):
+    def __init__(self, data_path, seq_length=1024, data_length=1024, padding_direction='left'):
         self.data_list = self.read_json(data_path)
-        assert seq_length >= data_length
-        self.padding_length = seq_length - data_length
+        self.padding_length = seq_length + 1 - data_length 
+        self.padding_direction = padding_direction
+        assert self.padding_length >= 0
+        print(f">>>>> padding length: {self.padding_length}")
     
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
         sample = self.data_list[idx]
-        sample['labels'] = [-100]*self.padding_length + sample['labels']
-        sample['input_ids'] = [0]*self.padding_length + sample['input_ids']
-        sample['attention_mask'] = [0]*self.padding_length + sample['attention_mask']
+        if self.padding_direction == 'left':
+            sample['labels'] = [-100]*self.padding_length + sample['labels']
+            sample['input_ids'] = [0]*self.padding_length + sample['input_ids']
+            sample['attention_mask'] = [0]*self.padding_length + sample['attention_mask']
+        else:
+            sample['labels'] =  sample['labels'] + [-100]*self.padding_length
+            sample['input_ids'] = sample['input_ids'] +  [0]*self.padding_length 
+            sample['attention_mask'] =  sample['attention_mask'] + [0]*self.padding_length
         sample = dict((k, torch.tensor(v)) for k, v in sample.items())
         return sample
             
@@ -129,6 +150,8 @@ def test_attn_mask_and_position_ids_building():
     mask = torch.ones(2, 10)
     mask[0][:4] = 0
     mask[1][:6] = 0
+    mask[0][8:] = 0
+    print(mask)
     attention_mask, loss_mask, position_ids = build_attn_mask_and_position_ids_with_padding(mask, 'cuda:0')
     print('attention_mask: ', attention_mask)
     print('loss_mask', loss_mask)
