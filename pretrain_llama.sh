@@ -77,7 +77,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --init-method-std 0.002 \
-        --fp16 \
         --DDP-impl local \
         --save $SAVE_CHECKPOINT_PATH \
         --load $LOAD_CHECKPOINT_PATH \
@@ -85,7 +84,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --log-params-norm \
         --tensorboard-dir $TENSORBOARD_PATH \
         --tensorboard-log-interval 1 \
-        --use-flash-attn \
         --no-load-optim \
         --no-load-rng \
         --finetune \
@@ -94,4 +92,12 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --make-vocab-size-divisible-by 1 \
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
-        --initial-loss-scale 32768.0
+        --initial-loss-scale 32768.0 \
+        --fp16 \
+        --attention-softmax-in-fp32 
+        # --use-flash-attn \
+        # --no-masked-softmax-fusion \
+        # --no-bias-gelu-fusion \
+        # --no-bias-dropout-fusion \
+        # --no-gradient-accumulation-fusion \
+        

@@ -1265,4 +1265,5 @@ def _add_llama_args(parser):
                        help='RMS norm epsilon.')
     group.add_argument('--data-length', type=int, default=1024,
                        help='Length of  each input in the dataset.')
+    group.add_argument('--padding-direction', type=str, default='left', choices=['left', 'right'])
     return parser

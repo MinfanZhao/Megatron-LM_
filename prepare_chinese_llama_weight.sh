@@ -7,7 +7,8 @@
 
 python ./tools/llama/checkpoint_convert_from_llama_pth.py \
     --input_dir ./checkpoints/chinese-llama \
-    --output_dir ./checkpoints/chinese-llama-7B-p2t2-test \
+    --output_dir ./checkpoints/chinese-llama-7B-p2t4-pad128 \
     --model_size 7B \
     --pipeline_size 2 \
-    --tensor_size 2
+    --tensor_size 4 \
+    --make-vocab-size-divisible-by 128
