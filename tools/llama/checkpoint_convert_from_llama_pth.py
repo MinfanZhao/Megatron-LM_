@@ -100,7 +100,7 @@ def write_json(text, path):
         json.dump(text, f)
 
 
-def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pipeline_size):
+def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pipeline_size, vocab_size_divisible_by):
     
     
     def read_state_dict(input_base_path):
@@ -132,7 +132,7 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
         return loaded
     
 
-    def convert_to_megatron_state_dict(llama_state_dict):
+    def convert_to_megatron_state_dict(llama_state_dict, vocab_size_divisible_by, tensor_size):
         
         num_shards = NUM_SHARDS[model_size]
         n_layers = NUM_LAYERS[model_size]
@@ -147,17 +147,6 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
         
         for layer_i in range(n_layers):
             if model_size == "7B":
-                # print(f'{layer_i} input_rms : {llama_state_dict[f"layers.{layer_i}.attention_norm.weight"][:20]}')
-                # print(f'{layer_i} wq : {llama_state_dict[f"layers.{layer_i}.attention.wq.weight"][0,:20]}')
-                # print(f'{layer_i} wk : {llama_state_dict[f"layers.{layer_i}.attention.wk.weight"][0,:20]}')
-                # print(f'{layer_i} wv : {llama_state_dict[f"layers.{layer_i}.attention.wv.weight"][0,:20]}')
-                # print(f'{layer_i} wo : {llama_state_dict[f"layers.{layer_i}.attention.wo.weight"][0,:20]}')
-                # print(f'{layer_i} post_attn_rms : {llama_state_dict[f"layers.{layer_i}.ffn_norm.weight"][:20]}')
-                
-                
-                # print(f'{layer_i} w1 {llama_state_dict[f"layers.{layer_i}.feed_forward.w1.weight"][0,:20]}')
-                # print(f'{layer_i} w3 {llama_state_dict[f"layers.{layer_i}.feed_forward.w3.weight"][0,:20]}')
-                # print(f'{layer_i} w2 {llama_state_dict[f"layers.{layer_i}.feed_forward.w2.weight"][0,:20]}')
                 
                 # Unsharded
                 megatron_state_dict['encoder'][f"layers.{layer_i}.input_rmsnorm.weight"] = \
@@ -228,18 +217,19 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
             
         if model_size == "7B":
         #     # Unsharded
-            print(f'word_embeddings:{llama_state_dict["tok_embeddings.weight"][0,:20]}')
-            print(f'output norm:{llama_state_dict["norm.weight"][:20]}')
-            print(f'output_layer:{llama_state_dict["output.weight"][0,:20]}')
-            megatron_state_dict['encoder']["final_rmsnorm.weight"] = llama_state_dict[f"norm.weight"]
-            megatron_state_dict['embedding']['word_embeddings']['weight'] = llama_state_dict["tok_embeddings.weight"]
-            megatron_state_dict['output_layer']['weight'] = llama_state_dict["output.weight"]
+            word_embeddings, output_layer = llama_state_dict["tok_embeddings.weight"], llama_state_dict["output.weight"]
+            megatron_state_dict['encoder']["final_rmsnorm.weight"] = llama_state_dict["norm.weight"]  
+            
         else:
-            megatron_state_dict['encoder']["final_rmsnorm.weight"] = llama_state_dict[0]["norm.weight"]
-            megatron_state_dict['embedding']['word_embeddings']['weight'] = \
-                torch.cat([llama_state_dict[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=1)
-            megatron_state_dict['output_layer']['weight'] = \
+            word_embeddings, output_layer = torch.cat([llama_state_dict[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=1), \
                 torch.cat([llama_state_dict[i]["output.weight"] for i in range(num_shards)], dim=0)
+            megatron_state_dict['encoder']["final_rmsnorm.weight"] = llama_state_dict[0]["norm.weight"]  
+                
+        word_embeddings, output_layer = pad_vocab(word_embeddings, output_layer, vocab_size_divisible_by, tensor_size)
+        
+        megatron_state_dict['embedding']['word_embeddings']['weight'] = word_embeddings
+        megatron_state_dict['output_layer']['weight'] = output_layer
+                
             
             
             
@@ -369,7 +359,8 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
     # megatron_state_dict = torch.load(megatron_model_path, map_location="cpu")
     
     llama_state_dict = read_state_dict(llama_model_path)
-    llama_to_megatron_state_dict = convert_to_megatron_state_dict(llama_state_dict)
+    
+    llama_to_megatron_state_dict = convert_to_megatron_state_dict(llama_state_dict, vocab_size_divisible_by, tensor_size)
     split_and_save_for_parallel(new_model_base, llama_to_megatron_state_dict, tensor_size, pipeline_size)    
     
     tracker_filename = os.path.join(new_model_base, 'latest_checkpointed_iteration.txt')
@@ -389,6 +380,30 @@ def fix_swiglu_weight(w1, w3):
     dense_h_to_4h_weight = torch.cat([w1,w3], dim=0)
     return dense_h_to_4h_weight
 
+
+def pad_vocab(word_embeddings, output_layer, vocab_size_divisible_by, tensor_size):
+    
+    def _vocab_size_with_padding(orig_vocab_size, vocab_size_divisible_by, tensor_model_parallel_size):
+        after = orig_vocab_size
+        multiple = vocab_size_divisible_by * tensor_model_parallel_size
+        while (after % multiple) != 0:
+            after += 1
+        print(' > padded vocab (size: {}) with {} dummy tokens '
+                '(new size: {})'.format(
+                    orig_vocab_size, after - orig_vocab_size, after), flush=True)
+        return after
+    
+    
+    print(word_embeddings.shape,output_layer.shape)
+    assert word_embeddings.shape[0] == output_layer.shape[0]
+    ( orig_vocab_size, hidden_size) = word_embeddings.shape
+    padded_vocab_size = _vocab_size_with_padding(orig_vocab_size, vocab_size_divisible_by, tensor_size)
+    word_embeddings = torch.cat([word_embeddings, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size)], dim=0)
+    output_layer = torch.cat([output_layer, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size)], dim=0)
+    return word_embeddings, output_layer
+    
+
+    
 
 
 def main():
@@ -414,6 +429,9 @@ def main():
     parser.add_argument(
         "--tensor_size", default="4", type=int
     )
+    parser.add_argument(
+        "--make-vocab-size-divisible-by", default="1", type=int
+    )
     args = parser.parse_args()
     convert_model(
         new_model_base=args.output_dir,
@@ -421,6 +439,7 @@ def main():
         model_size=args.model_size,
         tensor_size=args.tensor_size,
         pipeline_size=args.pipeline_size,
+        vocab_size_divisible_by = args.make_vocab_size_divisible_by
     )
 
 
