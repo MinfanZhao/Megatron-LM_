@@ -78,7 +78,7 @@ class KXDigitDataset(Dataset):
         self.padding_length = seq_length + 1 - data_length 
         self.padding_direction = padding_direction
         assert self.padding_length >= 0
-        print(f">>>>> padding length: {self.padding_length}")
+        print(f">>>>> data length: {data_length} | sequence length: {seq_length} | dataset padding length: {self.padding_length}")
     
     def __len__(self):
         return len(self.data_list)

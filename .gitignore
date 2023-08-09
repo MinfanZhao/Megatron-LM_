@@ -8,4 +8,5 @@ tensorboard
 backup
 checkpoints
 data
-script
+*.npz
+debug_*

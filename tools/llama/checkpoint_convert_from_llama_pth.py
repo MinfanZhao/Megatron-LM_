@@ -264,57 +264,62 @@ def convert_model(new_model_base, llama_model_path, model_size, tensor_size, pip
             
             for layer_index in range(layer_per_partition):
                 splited_state_dict['encoder'][f"layers.{layer_index}.input_rmsnorm.weight"] = \
-                    whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.input_rmsnorm.weight"]
+                    whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.input_rmsnorm.weight"].clone()
                     
                 attention_qkv = whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.self_attention.query_key_value.weight"]
                 attention_qkv_shape = attention_qkv.shape
                 splited_attention_qkv = attention_qkv.view(tensor_size, -1, attention_qkv_shape[1])[tensor_rank,:,:]
                 splited_attention_qkv = splited_attention_qkv.reshape(-1, attention_qkv_shape[1])
-                splited_state_dict['encoder'][f"layers.{layer_index}.self_attention.query_key_value.weight"] = splited_attention_qkv
+                splited_state_dict['encoder'][f"layers.{layer_index}.self_attention.query_key_value.weight"] = splited_attention_qkv.clone()
                     
                     
                 attention_dense = whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.self_attention.dense.weight"]
                 splited_attention_dense = attention_dense.view(attention_dense.shape[0],tensor_size, -1)[:,tensor_rank,:]
-                splited_state_dict['encoder'][f"layers.{layer_index}.self_attention.dense.weight"] = splited_attention_dense
+                splited_state_dict['encoder'][f"layers.{layer_index}.self_attention.dense.weight"] = splited_attention_dense.clone()
                     
                     
                 splited_state_dict['encoder'][f"layers.{layer_index}.post_attention_rmsnorm.weight"] = \
-                    whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.post_attention_rmsnorm.weight"]
+                    whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.post_attention_rmsnorm.weight"].clone()
                     
                     
                 mlp_in = whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.mlp.dense_h_to_4h.weight"]
                 splited_mlp_in = mlp_in.view(2, tensor_size, -1, mlp_in.shape[1])[:,tensor_rank,:,:]
                 splited_mlp_in = splited_mlp_in.reshape(-1, mlp_in.shape[1])
-                splited_state_dict['encoder'][f"layers.{layer_index}.mlp.dense_h_to_4h.weight"] = splited_mlp_in
+                splited_state_dict['encoder'][f"layers.{layer_index}.mlp.dense_h_to_4h.weight"] = splited_mlp_in.clone()
                    
                     
                 mlp_out = whole_state_dict['encoder'][f"layers.{layer_index + start_layer_index}.mlp.dense_4h_to_h.weight"]
                 splited_mlp_out = mlp_out.view(mlp_out.shape[0], tensor_size, -1)[:,tensor_rank,:]
-                splited_state_dict['encoder'][f"layers.{layer_index}.mlp.dense_4h_to_h.weight"] = splited_mlp_out
+                splited_state_dict['encoder'][f"layers.{layer_index}.mlp.dense_4h_to_h.weight"] = splited_mlp_out.clone()
                     
             if is_first_stage:
                 word_embeddings = whole_state_dict['embedding']['word_embeddings']['weight']
                 splited_word_embedding = word_embeddings.view(tensor_size, -1 ,word_embeddings.shape[1])[tensor_rank,:,:]
-                splited_state_dict['embedding'] = {'word_embeddings':{'weight':splited_word_embedding}}
+                splited_state_dict['embedding'] = {'word_embeddings':{'weight':splited_word_embedding.clone()}}
                 
             if is_last_stage:
                 output_layer = whole_state_dict['output_layer']['weight']
                 splited_output_layer = output_layer.view(tensor_size, -1 ,output_layer.shape[1])[tensor_rank,:,:]
-                splited_state_dict['output_layer'] = {'weight':splited_output_layer}
+                splited_state_dict['output_layer'] = {'weight':splited_output_layer.clone()}
                 # print('show keys:')
                 # print(whole_state_dict['encoder'].keys())
                 # print(splited_state_dict['encoder'].keys())
-                splited_state_dict['encoder']["final_rmsnorm.weight"] = whole_state_dict['encoder']["final_rmsnorm.weight"]
+                splited_state_dict['encoder']["final_rmsnorm.weight"] = whole_state_dict['encoder']["final_rmsnorm.weight"].clone()
             
-            # print(tensor_rank, pipeline_rank, splited_state_dict['encoder'].keys())
-            for key in splited_state_dict['encoder'].keys():
-                print(key, splited_state_dict['encoder'][key].shape)
+            print(tensor_rank, pipeline_rank, splited_state_dict['encoder'].keys())
+            for key, value in splited_state_dict['encoder'].items():
+                print(key, value.shape)
+                # print(f"================= {torch.isnan(value).any() or torch.isinf(value).any()} ======================")
             if is_first_stage:
+                print("> is first stage")
                 for key, value in splited_state_dict['embedding']['word_embeddings'].items():
                     print(key, value.shape)
+                    # print(f"================= {torch.isnan(value).any() or torch.isinf(value).any()} ======================")
             if is_last_stage:
+                print("> is last stage")
                 for key, value in splited_state_dict['output_layer'].items():
                     print(key, value.shape)
+                    # print(f"================= {torch.isnan(value).any() or torch.isinf(value).any()}  ======================")
             
             
             return splited_state_dict
@@ -398,8 +403,8 @@ def pad_vocab(word_embeddings, output_layer, vocab_size_divisible_by, tensor_siz
     assert word_embeddings.shape[0] == output_layer.shape[0]
     ( orig_vocab_size, hidden_size) = word_embeddings.shape
     padded_vocab_size = _vocab_size_with_padding(orig_vocab_size, vocab_size_divisible_by, tensor_size)
-    word_embeddings = torch.cat([word_embeddings, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size)], dim=0)
-    output_layer = torch.cat([output_layer, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size)], dim=0)
+    word_embeddings = torch.cat([word_embeddings, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size, dtype=word_embeddings.dtype)], dim=0)
+    output_layer = torch.cat([output_layer, torch.zeros(padded_vocab_size-orig_vocab_size, hidden_size, dtype=output_layer.dtype)], dim=0)
     return word_embeddings, output_layer
     
 
