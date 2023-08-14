@@ -90,7 +90,6 @@ def train_valid_datasets_provider():
 
     print_rank_0('> building train, validation, and test datasets '
                  'for SFT ...')
-    
     train_ds = KXDigitDataset(args.train_data_path[0], args.seq_length, args.data_length, args.padding_direction)
     valid_ds = KXDigitDataset(args.test_data_path[0], args.seq_length, args.data_length, args.padding_direction)
     

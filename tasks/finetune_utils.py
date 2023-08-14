@@ -77,16 +77,15 @@ def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
     rank = mpu.get_data_parallel_rank()
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank)
-
     # Data loader. Note that batch size is the per GPU batch size.
     data_loader = torch.utils.data.DataLoader(dataset,
-                                              batch_size=micro_batch_size,
-                                              sampler=sampler,
-                                              shuffle=False,
-                                              num_workers=num_workers,
-                                              drop_last=drop_last,
-                                              pin_memory=True,
-                                              collate_fn=task_collate_fn)
+                                            batch_size=micro_batch_size,
+                                            sampler=sampler,
+                                            shuffle=False,
+                                            num_workers=num_workers,
+                                            drop_last=drop_last,
+                                            pin_memory=True,
+                                            collate_fn=task_collate_fn)
 
     return data_loader
 
@@ -109,35 +108,50 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
 
     print_rank_0('building train and validation dataloaders ...')
     # Training dataset.
-    train_dataloader = build_data_loader(train_dataset, args.micro_batch_size,
-                                         args.num_workers, not args.keep_last,
-                                         task_collate_fn)
-    # Set the training iterations.
-    args.train_iters_per_epoch = len(train_dataloader) // get_num_microbatches()
-    args.train_iters = args.epochs * args.train_iters_per_epoch
-    # Validation dataset. For this dataset, we do not need to set up
-    # shuffling so we can just use a simple infinite loop.
-    valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
-                                          args.num_workers, not args.keep_last,
-                                          task_collate_fn)
-    valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
-
-    # Now that we've built the data loaders, set batch_size arguments
-    # to the actual batch size the model will see for this dataset.
-    # This is necessary so pipeline transfers know what size they are
-    # and the LR schedule, which is based on samples seen, gets set
-    # correctly.
+    
     args.orig_micro_batch_size = args.micro_batch_size
     args.orig_global_batch_size = args.global_batch_size
-    if hasattr(train_dataset, 'sample_multiplier'):
-        # If our dataset as a sample_multiplier attribute that means
-        # each "sample" from the dataset actually has multiple samples
-        # that will collapse into the batch dimension (for example in
-        # the RACE dataset that has several options), we need to
-        # account for that when setting the micro batch size.
-        args.micro_batch_size *= train_dataset.sample_multiplier
-        args.global_batch_size *= train_dataset.sample_multiplier
+    
+    train_dataloader, valid_dataloader = None, None
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        train_dataloader = build_data_loader(train_dataset, args.micro_batch_size,
+                                            args.num_workers, not args.keep_last,
+                                            task_collate_fn)
+        # Validation dataset. For this dataset, we do not need to set up
+        # shuffling so we can just use a simple infinite loop.
+        valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
+                                            args.num_workers, not args.keep_last,
+                                            task_collate_fn)
+        valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
+        # Set the training iterations.
+        args.train_iters_per_epoch = len(train_dataloader) // get_num_microbatches()
+        # Now that we've built the data loaders, set batch_size arguments
+        # to the actual batch size the model will see for this dataset.
+        # This is necessary so pipeline transfers know what size they are
+        # and the LR schedule, which is based on samples seen, gets set
+        # correctly.
+        
+        if hasattr(train_dataset, 'sample_multiplier'):
+            # If our dataset as a sample_multiplier attribute that means
+            # each "sample" from the dataset actually has multiple samples
+            # that will collapse into the batch dimension (for example in
+            # the RACE dataset that has several options), we need to
+            # account for that when setting the micro batch size.
+            args.micro_batch_size *= train_dataset.sample_multiplier
+            args.global_batch_size *= train_dataset.sample_multiplier
+        share_args = torch.cuda.LongTensor(
+            [int(args.train_iters_per_epoch), int(args.micro_batch_size), int(args.global_batch_size)])
+    else:
+        share_args = torch.cuda.LongTensor([0, 0, 0])
+    torch.distributed.broadcast(share_args,
+                            mpu.get_tensor_model_parallel_src_rank(),
+                            group=mpu.get_tensor_model_parallel_group())
+    args.train_iters_per_epoch = share_args[0].item()
+    args.micro_batch_size = share_args[1].item()
+    args.global_batch_size = share_args[2].item()
+    
+    args.train_iters = args.epochs * args.train_iters_per_epoch
     return train_dataloader, valid_dataloader
 
 
@@ -170,8 +184,11 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(args.seed + epoch)
-        data_iterator = iter(train_dataloader)
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            train_dataloader.sampler.set_epoch(args.seed + epoch)
+            data_iterator = iter(train_dataloader)
+        else:
+            data_iterator = None
         # For all the batches in the dataset.
         for iteration_ in range(args.train_iters_per_epoch):
 
@@ -253,7 +270,10 @@ def finetune(train_valid_datasets_provider, model_provider,
     # Train and validation data loaders.
     timers('train/valid/test dataset/dataloder', log_level=0).start()
     if args.epochs > 0:
-        train_dataset, valid_dataset = train_valid_datasets_provider()
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            train_dataset, valid_dataset = train_valid_datasets_provider()
+        else:
+            train_dataset, valid_dataset = None, None
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
             train_dataset, valid_dataset, task_collate_fn)
     else:
