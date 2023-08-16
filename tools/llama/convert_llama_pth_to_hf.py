@@ -67,7 +67,7 @@ def write_json(text, path):
         json.dump(text, f)
 
 
-def write_model(model_path, input_base_path, model_size):
+def write_model(model_path, input_base_path, model_size, fp32=False):
     os.makedirs(model_path, exist_ok=True)
     tmp_model_path = os.path.join(model_path, "tmp")
     os.makedirs(tmp_model_path, exist_ok=True)
@@ -220,7 +220,11 @@ def write_model(model_path, input_base_path, model_size):
     gc.collect()
 
     print("Loading the checkpoint in a Llama model.")
-    model = LlamaForCausalLM.from_pretrained(tmp_model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    if fp32:
+        model = LlamaForCausalLM.from_pretrained(tmp_model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+    
+    else:
+        model = LlamaForCausalLM.from_pretrained(tmp_model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
     # Avoid saving this as part of the config.
     del model.config._name_or_path
 
@@ -250,12 +254,17 @@ def main():
         "--output_dir",
         help="Location to write HF model and tokenizer",
     )
+    parser.add_argument(
+        "--fp32", action="store_true",
+        help="Location to write HF model and tokenizer",
+    )
     args = parser.parse_args()
     if args.model_size != "tokenizer_only":
         write_model(
             model_path=args.output_dir,
             input_base_path=os.path.join(args.input_dir, args.model_size),
             model_size=args.model_size,
+            fp32=args.fp32
         )
     write_tokenizer(
         tokenizer_path=args.output_dir,

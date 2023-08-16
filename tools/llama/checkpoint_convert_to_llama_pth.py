@@ -2,6 +2,7 @@ import argparse
 import os
 import torch
 import sys
+import gc
 
 
 INTERMEDIATE_SIZE_MAP = {
@@ -91,15 +92,16 @@ def combine_from_split_weight(megatron_model_base, model_size, tensor_parallel_s
         for layer_index in range(layer_per_partition):
             megatron_state_dict['encoder'][f'layers.{layer_offset + layer_index}.input_rmsnorm.weight'] = \
                         state_dict_shards[pipeline_rank][0]['encoder'][f'layers.{layer_index}.input_rmsnorm.weight']
-                        
+            
             megatron_state_dict['encoder'][f'layers.{layer_offset + layer_index}.self_attention.query_key_value.weight'] = \
                 torch.cat([tensor_shard['encoder'][f'layers.{layer_index}.self_attention.query_key_value.weight'].view(
-                    n_heads_per_shard, 3, dims_per_head, dim) for tensor_shard in state_dict_shards[pipeline_rank]], dim=0).view(
+                    1, -1, dim) for tensor_shard in state_dict_shards[pipeline_rank]], dim=0).view(
                     -1, dim)
-                
+            # dense_shape = state_dict_shards[pipeline_rank][0]['encoder'][f'layers.{layer_offset + layer_index}.self_attention.dense.weight'].shape
+            # print(f"====== attention qkv shape:{dense_shape}==========") 
             megatron_state_dict['encoder'][f'layers.{layer_offset + layer_index}.self_attention.dense.weight'] = \
                 torch.cat([tensor_shard['encoder'][f'layers.{layer_index}.self_attention.dense.weight'].view(
-                    n_heads_per_shard, dims_per_head, dim) for tensor_shard in state_dict_shards[pipeline_rank]], dim=1).view(
+                    dim, 1, -1) for tensor_shard in state_dict_shards[pipeline_rank]], dim=1).view(
                     dim, dim)
                 
             megatron_state_dict['encoder'][f'layers.{layer_offset + layer_index}.post_attention_rmsnorm.weight'] = \
@@ -146,39 +148,108 @@ def convert_to_llama_state_dict(megatron_state_dict, model_size):
     dims_per_head = dim // n_heads
     llama_state_dict = {}
     rope_freqs = 1.0 / (10000 ** (torch.arange(0, dims_per_head, 2).float() / dims_per_head))
-    if model_size == '7B':
-        for layer_i in range(n_layers):
-            llama_state_dict[f"layers.{layer_i}.attention_norm.weight"] = \
-                megatron_state_dict['encoder'][f"layers.{layer_i}.input_rmsnorm.weight"]
-            wq,wk,wv = fix_attention_weight_to_llama(
-                megatron_state_dict['encoder'][f"layers.{layer_i}.self_attention.query_key_value.weight"],
-                n_heads, dims_per_head, dim)
-            llama_state_dict[f"layers.{layer_i}.attention.wq.weight"] = wq.reshape(dim, dim)
-            llama_state_dict[f"layers.{layer_i}.attention.wk.weight"] = wk.reshape(dim, dim)
-            llama_state_dict[f"layers.{layer_i}.attention.wv.weight"] = wv.reshape(dim, dim)
-            llama_state_dict[f"layers.{layer_i}.attention.wo.weight"] = \
-                megatron_state_dict['encoder'][f"layers.{layer_i}.self_attention.dense.weight"]
-            llama_state_dict[f"layers.{layer_i}.ffn_norm.weight"] = \
-                megatron_state_dict['encoder'][f"layers.{layer_i}.post_attention_rmsnorm.weight"]
-            w1,w3 = fix_swiglu_weight_to_llama(
-                megatron_state_dict['encoder'][f"layers.{layer_i}.mlp.dense_h_to_4h.weight"])
-            llama_state_dict[f"layers.{layer_i}.feed_forward.w1.weight"] = w1.reshape(-1, dim)
-            llama_state_dict[f"layers.{layer_i}.feed_forward.w2.weight"] = \
-                megatron_state_dict['encoder'][f"layers.{layer_i}.mlp.dense_4h_to_h.weight"]
-            llama_state_dict[f"layers.{layer_i}.feed_forward.w3.weight"] = w3.reshape(-1, dim)
-            llama_state_dict[f"layers.{layer_i}.attention.inner_attention.rope.freqs"] = rope_freqs.half()
-                
+    
+    for layer_i in range(n_layers):
+        llama_state_dict[f"layers.{layer_i}.attention_norm.weight"] = \
+            megatron_state_dict['encoder'][f"layers.{layer_i}.input_rmsnorm.weight"]
+        wq,wk,wv = fix_attention_weight_to_llama(
+            megatron_state_dict['encoder'][f"layers.{layer_i}.self_attention.query_key_value.weight"],
+            n_heads, dims_per_head, dim)
+        llama_state_dict[f"layers.{layer_i}.attention.wq.weight"] = wq.reshape(dim, dim)
+        llama_state_dict[f"layers.{layer_i}.attention.wk.weight"] = wk.reshape(dim, dim)
+        llama_state_dict[f"layers.{layer_i}.attention.wv.weight"] = wv.reshape(dim, dim)
+        llama_state_dict[f"layers.{layer_i}.attention.wo.weight"] = \
+            megatron_state_dict['encoder'][f"layers.{layer_i}.self_attention.dense.weight"]
+        llama_state_dict[f"layers.{layer_i}.ffn_norm.weight"] = \
+            megatron_state_dict['encoder'][f"layers.{layer_i}.post_attention_rmsnorm.weight"]
+        w1,w3 = fix_swiglu_weight_to_llama(
+            megatron_state_dict['encoder'][f"layers.{layer_i}.mlp.dense_h_to_4h.weight"])
+        llama_state_dict[f"layers.{layer_i}.feed_forward.w1.weight"] = w1.reshape(-1, dim)
+        llama_state_dict[f"layers.{layer_i}.feed_forward.w2.weight"] = \
+            megatron_state_dict['encoder'][f"layers.{layer_i}.mlp.dense_4h_to_h.weight"]
+        llama_state_dict[f"layers.{layer_i}.feed_forward.w3.weight"] = w3.reshape(-1, dim)
+        llama_state_dict[f"layers.{layer_i}.attention.inner_attention.rope.freqs"] = rope_freqs.half()
             
-        llama_state_dict[f"norm.weight"] = megatron_state_dict['encoder']["final_rmsnorm.weight"]
-        llama_state_dict["tok_embeddings.weight"] = \
-            megatron_state_dict['embedding']['word_embeddings']['weight']
-        llama_state_dict["output.weight"] = \
-            megatron_state_dict['output_layer']['weight']
-            
-        print("======= llama state dict =======")
-        for key, value in llama_state_dict.items():
-            print(key, value.shape)
-        return llama_state_dict
+        
+    llama_state_dict[f"norm.weight"] = megatron_state_dict['encoder']["final_rmsnorm.weight"]
+    llama_state_dict["tok_embeddings.weight"] = \
+        megatron_state_dict['embedding']['word_embeddings']['weight']
+    llama_state_dict["output.weight"] = \
+        megatron_state_dict['output_layer']['weight']
+        
+    print("======= llama state dict =======")
+    for key, value in llama_state_dict.items():
+        print(key, value.shape)
+    return llama_state_dict
+        
+    
+
+def split_for_shards(llama_state_dict, num_shards):
+    new_state_dicts = [dict() for _ in range(num_shards)]
+    for k in list(llama_state_dict.keys()):
+        v = llama_state_dict[k]
+        if k is not None:
+            if k=='tok_embeddings.weight':
+                print(f"Processing {k}")
+                assert v.size(1)%num_shards==0
+                splits = v.split(v.size(1)//num_shards,dim=1)
+            elif k=='output.weight':
+                print(f"Processing {k}")
+                if v.size(0)%num_shards==0:
+                    splits = v.split(v.size(0)//num_shards,dim=0)
+                else:
+                    size_list = [v.size(0)//num_shards] * num_shards
+                    size_list[-1] += v.size(0)%num_shards
+                    splits = v.split(size_list, dim=0) # 13B: size_list == [24976,24977]
+            elif k=='norm.weight':
+                print(f"Processing {k}")
+                splits = [v] * num_shards
+            elif 'ffn_norm.weight' in k:
+                print(f"Processing {k}")
+                splits = [v] * num_shards
+            elif 'attention_norm.weight' in k:
+                print(f"Processing {k}")
+                splits = [v] * num_shards
+
+
+            elif 'w1.weight' in k:
+                print(f"Processing {k}")
+                splits = v.split(v.size(0)//num_shards,dim=0)
+            elif 'w2.weight' in k:
+                print(f"Processing {k}")
+                splits = v.split(v.size(1)//num_shards,dim=1)
+            elif 'w3.weight' in k:
+                print(f"Processing {k}")
+                splits = v.split(v.size(0)//num_shards,dim=0)
+
+
+            elif 'wo.weight' in k:
+                print(f"Processing {k}")
+                splits = v.split(v.size(1)//num_shards,dim=1)
+
+            elif 'wv.weight' in k:
+                print(f"Processing {k}")
+                splits = v.split(v.size(0)//num_shards,dim=0)
+
+            elif "wq.weight" in k or "wk.weight" in k:
+                print(f"Processing {k}")
+                # v = unpermute(v)
+                splits = v.split(v.size(0)//num_shards,dim=0)
+            elif "rope.freqs" in k:
+                print(f"Processing {k}")
+                splits = [v] * num_shards
+            else:
+                print(f"Unexpected key {k}")
+                raise ValueError
+            for sd,split in zip(new_state_dicts,splits):
+                sd[k] = split.clone()
+                del split
+            del splits
+        del llama_state_dict[k],v
+        gc.collect()    # Effectively enforce garbage collection
+    return new_state_dicts
+    
+
             
 def fix_attention_weight_to_llama(query_key_value_weight, n_heads, dims_per_head, dim):
     wq,wk,wv = torch.unbind(query_key_value_weight.view(n_heads, 3, dims_per_head, dim), dim = 1)
@@ -196,11 +267,15 @@ def convert_model(new_model_base, megatron_model_base, model_size, tensor_parall
     # os.makedirs(new_model_base, exist_ok=True)
     megatron_state_dict = combine_from_split_weight(megatron_model_base, model_size, tensor_parallel_size, pipeline_parallel_size)
     llama_state_dict = convert_to_llama_state_dict(megatron_state_dict, model_size)
+    new_model_base = os.path.join(new_model_base, model_size)
+    os.makedirs(new_model_base, exist_ok=True)
+    print(f"make dir path:{new_model_base}")
     if model_size == '7B':
-        new_model_base = os.path.join(new_model_base,model_size)
-        os.makedirs(new_model_base, exist_ok=True)
-        print(f"make dir path:{new_model_base}")
         torch.save(llama_state_dict, os.path.join(new_model_base, 'consolidated.00.pth'))
+    else:
+        splits = split_for_shards(llama_state_dict, NUM_SHARDS[model_size])
+        for index, shard in enumerate(splits):
+            torch.save(shard, os.path.join(new_model_base, f'consolidated.0{index}.pth'))
     
 
 

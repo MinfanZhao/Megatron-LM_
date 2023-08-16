@@ -1,11 +1,3 @@
-"""
-Usage: 
-python merge_llama_with_chinese_lora.py \
-    --base_model path/to/llama/model \
-    --lora_model path/to/first/lora/model [path/to/second/lora/model] \
-    --output_type [pth|huggingface] \
-    --output_dir path/to/output/dir
-"""
 import argparse
 import json
 import os

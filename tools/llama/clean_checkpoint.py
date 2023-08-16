@@ -7,9 +7,14 @@ def clean_state_dict(megatron_model_load_base, megatron_model_save_base,
                      pipeline_parallel_size, tensor_parallel_size, save_optim, save_rng, to_release):
     tracker_filename = os.path.join(megatron_model_load_base, 'latest_checkpointed_iteration.txt')
     with open(tracker_filename, 'r') as f:
-        iteration = int(f.read().strip())
-    megatron_model_load_base = os.path.join(
-        megatron_model_load_base, 'iter_{:07d}'.format(iteration))
+        iteration = f.read().strip()
+        if iteration == 'release':
+            megatron_model_load_base = os.path.join(
+                megatron_model_load_base, 'release')
+        else:
+            iteration = int(iteration)
+            megatron_model_load_base = os.path.join(
+                megatron_model_load_base, 'iter_{:07d}'.format(iteration))
     
     
     os.makedirs(megatron_model_save_base, exist_ok=True)
@@ -27,10 +32,10 @@ def clean_state_dict(megatron_model_load_base, megatron_model_save_base,
             megatron_model_save_base, 'iter_{:07d}'.format(iteration))
     
     
-    
+    pipeline_parallel = pipeline_parallel_size > 1
     for pipeline_rank in range(pipeline_parallel_size):
         for tensor_rank in range(tensor_parallel_size):
-            if not pipeline_parallel_size:
+            if not pipeline_parallel:
                 common_path = f'mp_rank_{tensor_rank:02d}'          
             else:
                 common_path = f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}'
@@ -49,7 +54,7 @@ def clean_state_dict(megatron_model_load_base, megatron_model_save_base,
             
             save_checkpoint_path = os.path.join(
                 save_base, "model_optim_rng.pt")
-            print(f"saving {load_checkpoint_path}")
+            print(f"saving {save_checkpoint_path}")
             torch.save(state_dict, save_checkpoint_path)
     
 def main():
