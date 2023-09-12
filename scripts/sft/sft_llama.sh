@@ -18,28 +18,32 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
 echo "distributed args: $DISTRIBUTED_ARGS"
 
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-LOAD_CHECKPOINT_PATH=./checkpoints/megatron-pretrain/chinese-llama-alpaca-plus-7B-p1t8-pad128
-TASK_NAME=chinese-llama-alpaca-plus-7B-p1t8-sft-sq2048-mbs1-gbs128-pad128
-SAVE_CHECKPOINT_PATH=./checkpoints/megatron-train/$TASK_NAME/
-TENSORBOARD_PATH=./tensorboard/megatron/$TASK_NAME/$DATETIME
 
-TOKENIZER_MODEL="./checkpoints/torch-pretrain/chinese-llama-alpaca-plus/tokenizer.model"
+LOAD_CHECKPOINT_PATH=/acsa-med/megatron-llama/megatron-pretrain/chinese-llama-alpaca-plus-7B-p1t4-pad128
+# /acsa-med/megatron-llama/megatron-pretrain/chinese-llama-alpaca-plus-7B-p1t8-pad128
+# ./checkpoints/megatron-pretrain/sw-chinese-llama-alpaca-plus-7B-p1t8-pad128/
+# 
+TASK_NAME=chinese-llama-alpaca-plus-7B-p1t1-sft-sq2048-mbs1-gbs128-pad128-test-speed
+SAVE_CHECKPOINT_PATH=/acsa-med/megatron-llama/megatron-train/$TASK_NAME/
+TENSORBOARD_PATH=./tensorboard/llama/$TASK_NAME/$DATETIME
+
+TOKENIZER_MODEL=./checkpoints/tokenizer/chinese-llama/tokenizer.model
 TRAIN_DATA_PATH=/acsa-med/dataset/sunway/iflytek_digital/right_padding/train_data_for_SW_token_ids_2048.json
 TEST_DATA_PATH=/acsa-med/dataset/sunway/iflytek_digital/right_padding/test_data_for_SW_token_ids_2048.json
 
 # args for llama 7B
-MODEL_ARGS="--num-layers 32 \
-        --hidden-size 4096 \
-        --num-attention-heads 32 \
-        --seq-length 2048 \
-        --max-position-embeddings 2048"
-
-# args for llama 13B
-# MODEL_ARGS="--num-layers 40 \
-#         --hidden-size 5120 \
-#         --num-attention-heads 40 \
+# MODEL_ARGS="--num-layers 8 \
+#         --hidden-size 4096 \
+#         --num-attention-heads 32 \
 #         --seq-length 2048 \
 #         --max-position-embeddings 2048"
+
+# args for llama 13B
+MODEL_ARGS="--num-layers 40 \
+        --hidden-size 5120 \
+        --num-attention-heads 40 \
+        --seq-length 2048 \
+        --max-position-embeddings 2048"
 
 # args for llama 33B
 # MODEL_ARGS="--num-layers 60 \
@@ -79,11 +83,11 @@ EVAL_ARGS="--eval-interval 1000 \
 OUTPUT_ARGS="--log-interval 1 \
         --save-interval 2500"
 
-DATASET_ARGS="--train-data-path $TRAIN_DATA_PATH \
+DATASET_ARGS="--train-data-path $TEST_DATA_PATH \
         --test-data-path $TEST_DATA_PATH \
         --data-length 2049 \
         --split 100,0,0 \
-        --num-workers 16 \
+        --num-workers 2 \
         --padding-direction right "
 
 
@@ -95,8 +99,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --pretrained-checkpoint $LOAD_CHECKPOINT_PATH \
         --tokenizer-type LLaMASentencePieceTokenizer \
         --tokenizer-model $TOKENIZER_MODEL \
-        --tensor-model-parallel-size 8 \
-        --pipeline-model-parallel-size 1 \
+        --tensor-model-parallel-size 1 \
+        --pipeline-model-parallel-size 8 \
         $MODEL_ARGS \
         $LLAMA_ARGS \
         $TRAIN_ARGS \
@@ -112,10 +116,12 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
         --log-params-norm \
         --tensorboard-dir $TENSORBOARD_PATH \
         --tensorboard-log-interval 1 \
-        --fp16 \
-        --use-flash-attn \
         --initial-loss-scale 4096.0 \
         --no-load-optim \
         --no-load-rng \
-        --finetune
+        --use-flash-attn \
+        --fp16 \
+        --finetune \
+        --log-timers-to-tensorboard \
+        --timing-log-level 2
         
