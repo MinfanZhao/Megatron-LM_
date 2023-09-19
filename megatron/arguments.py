@@ -36,6 +36,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_llama_args(parser)
+    parser = _add_sft_args(parser)
     
 
     # Custom arguments.
@@ -249,6 +250,10 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         args.ffn_hidden_size = 4 * args.hidden_size
+        
+    if args.llama_ffn_dim_multiplier is not None:
+        assert args.swiglu and args.llama_swiglu, \
+            "llama_ffn_dim_multiplier is only used in llama 2 and llama-swiglu should be True."
 
     if args.swiglu:
         # reduce the dimnesion for MLP since projections happens on
@@ -258,8 +263,11 @@ def validate_args(args, defaults={}):
         # will be a multiple of 64 / tp_size
         if args.llama_swiglu:
             # change block size to 256 and use ceil function instead of floor 
-            hidden_dim = int(2 * 4 * args.hidden_size  / 3)
-            args.ffn_hidden_size = 256 * ((hidden_dim + 256 - 1) // 256)
+            
+            swi_hidden_size = int(4 * args.hidden_size * 2 / 3)
+            if args.ffn_dim_multiplier is not None:
+                swi_hidden_size = int(args.llama_ffn_dim_multiplier * swi_hidden_size)
+            args.ffn_hidden_size = args.swiglu_multiple_of * ((swi_hidden_size + 256 - 1) // args.swiglu_multiple_of)
         else:
             args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
         
@@ -1258,11 +1266,22 @@ def _add_llama_args(parser):
     group = parser.add_argument_group(title="llama")
     group.add_argument('--llama-swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu with llama setting')
+    group.add_argument('--swiglu-multiple-of', type=int, default=256,
+                       help='make SwiGLU hidden layer size multiple of large power of 2.')
+    group.add_argument('--llama-ffn-dim-multiplier', type=int, default=None,
+                       help='multiply llama ffn dim in swiglu, only use in llama-2-70B currently.')
+    # group.add_argument('--llama-n-kv-heads', type=int, default=None,
+    #                    help='use small number of kv heads and repeat kv to reduce computation, only use in llama-2-70B')
     group.add_argument('--use-rmsnorm', action='store_true', 
                        help='Replace Layernorm with RMSNorm. '
                        'RMSNorm should be used if and only if training LLaMA LLM.')
     group.add_argument('--rmsnorm-epsilon', type=float, default=1e-6,
                        help='RMS norm epsilon.')
+    return parser
+
+
+def _add_sft_args(parser):
+    group = parser.add_argument_group(title="sft")
     group.add_argument('--data-length', type=int, default=1024,
                        help='Length of  each input in the dataset.')
     group.add_argument('--padding-direction', type=str, default='left', choices=['left', 'right'])
