@@ -265,7 +265,7 @@ def validate_args(args, defaults={}):
             # change block size to 256 and use ceil function instead of floor 
             
             swi_hidden_size = int(4 * args.hidden_size * 2 / 3)
-            if args.ffn_dim_multiplier is not None:
+            if args.llama_ffn_dim_multiplier is not None:
                 swi_hidden_size = int(args.llama_ffn_dim_multiplier * swi_hidden_size)
             args.ffn_hidden_size = args.swiglu_multiple_of * ((swi_hidden_size + 256 - 1) // args.swiglu_multiple_of)
         else:

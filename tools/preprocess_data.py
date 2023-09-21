@@ -65,10 +65,15 @@ class Encoder(object):
             Encoder.splitter = IdentitySplitter()
 
     def encode(self, json_line):
-        data = json.loads(json_line)
+        try:
+            data = json.loads(json_line)
+        except:
+            print(f"exception: {json_line}")
+            return {}, 0
+        
         ids = {}
         for key in self.args.json_keys:
-            text = data[key]
+            text = data[key].replace('<EOD>', '')
             doc_ids = []
             for sentence in Encoder.splitter.tokenize(text):
                 
@@ -155,60 +160,71 @@ def main():
     args = get_args()
     startup_start = time.time()
 
-    print("Opening", args.input)
-    fin = open(args.input, 'r', encoding='utf-8')
+    if os.path.isdir(args.input):
+        dir_path, file_name_list = args.input, os.listdir(args.input)
+    
+    else:
+        (dir_path, file_name) = os.path.split(args.input)
+        file_name_list = [file_name]
+        
+    for file_name in file_name_list:
+        if not (file_name.endswith('.json') or file_name.endswith('.jsonl')):
+            pass
+        file_path = os.path.join(dir_path, file_name)
+        print("Opening", file_path)
+        fin = open(file_path, 'r', encoding='utf-8')
 
-    if nltk_available and args.split_sentences:
-        nltk.download("punkt", quiet=True)
+        if nltk_available and args.split_sentences:
+            nltk.download("punkt", quiet=True)
 
-    encoder = Encoder(args)
-    tokenizer = build_tokenizer(args)
-    pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
-    encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
-    #encoded_docs = map(encoder.encode, fin)
+        encoder = Encoder(args)
+        tokenizer = build_tokenizer(args)
+        pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
+        encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
+        #encoded_docs = map(encoder.encode, fin)
 
-    level = "document"
-    if args.split_sentences:
-        level = "sentence"
+        level = "document"
+        if args.split_sentences:
+            level = "sentence"
 
-    print(f"Vocab size: {tokenizer.vocab_size}")
-    print(f"Output prefix: {args.output_prefix}")
-    output_bin_files = {}
-    output_idx_files = {}
-    builders = {}
-    for key in args.json_keys:
-        output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
-                                                      key, level)
-        output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
-                                                      key, level)
-        builders[key] = indexed_dataset.make_builder(output_bin_files[key],
-                                               impl=args.dataset_impl,
-                                               vocab_size=tokenizer.vocab_size)
+        print(f"Vocab size: {tokenizer.vocab_size}")
+        print(f"Output prefix: {args.output_prefix}")
+        output_bin_files = {}
+        output_idx_files = {}
+        builders = {}
+        for key in args.json_keys:
+            output_bin_files[key] = "{}_{}_{}_{}.bin".format(args.output_prefix, 
+                                                             os.path.splitext(file_name)[0], key, level)
+            output_idx_files[key] = "{}_{}_{}_{}.idx".format(args.output_prefix,
+                                                             os.path.splitext(file_name)[0], key, level)
+            builders[key] = indexed_dataset.make_builder(output_bin_files[key],
+                                                impl=args.dataset_impl,
+                                                vocab_size=tokenizer.vocab_size)
 
-    startup_end = time.time()
-    proc_start = time.time()
-    total_bytes_processed = 0
-    print("Time to startup:", startup_end - startup_start)
+        startup_end = time.time()
+        proc_start = time.time()
+        total_bytes_processed = 0
+        print("Time to startup:", startup_end - startup_start)
 
-    for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
-        total_bytes_processed += bytes_processed
-        for key, sentences in doc.items():
-            if len(sentences) == 0:
-                continue
-            for sentence in sentences:
-                builders[key].add_item(torch.IntTensor(sentence))
-            builders[key].end_document()
-        if i % args.log_interval == 0:
-            current = time.time()
-            elapsed = current - proc_start
-            mbs = total_bytes_processed/elapsed/1024/1024
-            print(f"Processed {i} documents",
-                  f"({i/elapsed} docs/s, {mbs} MB/s).",
-                  file=sys.stderr)
-    print("Done! Now finalizing.")
+        for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
+            total_bytes_processed += bytes_processed
+            for key, sentences in doc.items():
+                if len(sentences) == 0:
+                    continue
+                for sentence in sentences:
+                    builders[key].add_item(torch.IntTensor(sentence))
+                builders[key].end_document()
+            if i % args.log_interval == 0:
+                current = time.time()
+                elapsed = current - proc_start
+                mbs = total_bytes_processed/elapsed/1024/1024
+                print(f"Processed {i} documents",
+                    f"({i/elapsed} docs/s, {mbs} MB/s).",
+                    file=sys.stderr)
+        print(f"Done! Now finalizing from {file_path}")
 
-    for key in args.json_keys:
-        builders[key].finalize(output_idx_files[key])
+        for key in args.json_keys:
+            builders[key].finalize(output_idx_files[key])
 
 if __name__ == '__main__':
     main()
