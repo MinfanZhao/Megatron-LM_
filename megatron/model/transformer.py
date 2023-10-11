@@ -754,7 +754,10 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layernorm on the attention output
         if self.use_rmsnorm:
-            self.post_attention_rmsnorm = RMSNorm(args.hidden_size, eps=args.rmsnorm_epsilon)
+            self.post_attention_rmsnorm = RMSNorm(
+                args.hidden_size, 
+                eps=args.rmsnorm_epsilon, 
+                sequence_parallel=args.sequence_parallel)
         else:
             self.post_attention_layernorm = LayerNorm(
                 args.hidden_size,
@@ -771,7 +774,10 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
             if self.use_rmsnorm:
-                self.post_inter_attention_rmsnorm = RMSNorm(args.hidden_size, eps=args.rmsnorm_epsilon)
+                self.post_inter_attention_rmsnorm = RMSNorm(
+                    args.hidden_size, 
+                    eps=args.rmsnorm_epsilon, 
+                    sequence_parallel=args.sequence_parallel)
             else:
                 self.post_inter_attention_layernorm = LayerNorm(
                     args.hidden_size,
@@ -1157,7 +1163,7 @@ class ParallelTransformer(MegatronModule):
             if args.use_rmsnorm:
                 self.final_rmsnorm = RMSNorm(
                     args.hidden_size,
-                    eps=args.rmsnorm_epsilon)
+                    eps=args.rmsnorm_epsilon, sequence_parallel=args.sequence_parallel)
             else:
                 self.final_layernorm = LayerNorm(
                     args.hidden_size,

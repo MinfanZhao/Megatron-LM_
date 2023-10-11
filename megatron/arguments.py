@@ -362,7 +362,6 @@ def validate_args(args, defaults={}):
         args.async_tensor_model_parallel_allreduce = False
         
     if args.use_rmsnorm:
-        assert not args.sequence_parallel, "rmsnorm not yet supported for sequence parallel"
         assert not args.no_persist_layer_norm, "no_persist_layer_norm is invalid when rms norm is used for training"
         assert not args.apply_layernorm_1p, "apply_layernorm_1p is invalid when rms norm is used for training"
     
