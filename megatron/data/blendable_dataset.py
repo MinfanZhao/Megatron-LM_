@@ -30,8 +30,8 @@ class BlendableDataset(torch.utils.data.Dataset):
 
         # Build indecies.
         start_time = time.time()
-        assert num_datasets < 255
-        self.dataset_index = np.zeros(self.size, dtype=np.uint8)
+        # assert num_datasets < 255
+        self.dataset_index = np.zeros(self.size, dtype=np.int32)
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
 
         from megatron.data import helpers
