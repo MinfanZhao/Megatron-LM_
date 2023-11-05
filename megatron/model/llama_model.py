@@ -11,6 +11,8 @@ from .language_model import parallel_lm_logits
 from .language_model import get_language_model
 from .utils import init_method_normal
 from .utils import scaled_init_method_normal
+from megatron.iter_counter import iter_counter
+import numpy as np
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
@@ -86,7 +88,9 @@ class LLaMAModel(MegatronModule):
             ret_position_ids=ret_position_ids,
             ret_attn_mask=ret_attn_mask,
             inference_params=inference_params)
-
+        iter_num = iter_counter[0]
+        np.savez(f'test_data/iter_{iter_num:07d}/lm_output.npz', 
+                 lm_output=lm_output.detach().cpu().numpy())
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
@@ -94,6 +98,7 @@ class LLaMAModel(MegatronModule):
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
         else:
+            
             return lm_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):

@@ -41,6 +41,8 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 import setproctitle
+from megatron.iter_counter import iter_counter
+import numpy as np
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -433,6 +435,7 @@ def train_step(forward_step_func, data_iterator,
         forward_only=False,
         timers=fwd_bwd_timers)
     timers('forward-backward').stop()
+    
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -447,10 +450,50 @@ def train_step(forward_step_func, data_iterator,
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
+    
+    name_list_part_1, name_list_part_2 = [], []
+    name_list = []
+    for model_module in model:
+        for name, param in model_module.named_parameters():
+            if len(param.shape) == 1:
+                name_list_part_2.append(name)
+            else:
+                name_list_part_1.append(name)
+    name_groups = [name_list_part_1 , name_list_part_2]
+    param_fp16, grad_fp16 = {}, {}
+    param_fp32, grad_fp32 = {}, {}
+     
+    for name_group, model_group, main_group in zip(name_groups, optimizer.float16_groups,
+                                           optimizer.fp32_from_float16_groups):
+            for name, model_param, main_param in zip(name_group, model_group, main_group): 
+                if hasattr(model_param, 'main_grad'):
+                    main_param.grad = model_param.main_grad.float()
+                    print(f"{name} model param: {model_param.shape} dtype:{model_param.dtype}, model main grad shape:{model_param.main_grad.shape} dtype:{model_param.main_grad.dtype}")
+                    print(f"{name} main param: {main_param.shape} dtype:{main_param.dtype}, main grad shape:{main_param.grad.shape} dtype:{main_param.grad.dtype}")
+                    param_fp16[name] = model_param.detach().cpu().numpy()
+                    grad_fp16[name] = model_param.main_grad.detach().cpu().numpy()
+                    param_fp32[name] = main_param.detach().cpu().numpy()
+                    grad_fp32[name] = main_param.grad.detach().cpu().numpy()
+                else:
+                    print(f"{name} has no main_grad")
+                    if model_param.grad is not None:
+                        
+                        main_param.grad = model_param.grad.float()
+                    else:
+                        print(f"{name} has no grad")
+            iter_num = iter_counter[0]
+            np.savez(f"test_data/iter_{iter_num:07d}/param_fp16.npz", **param_fp16)
+            np.savez(f"test_data/iter_{iter_num:07d}/grad_fp16.npz", **grad_fp16)
+            np.savez(f"test_data/iter_{iter_num:07d}/param_fp32.npz", **param_fp32)
+            np.savez(f"test_data/iter_{iter_num:07d}/grad_fp32.npz", **grad_fp32)
+            
+    
+    
 
     # Gather params.
     if update_successful:
@@ -471,6 +514,8 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 0
     else:
         skipped_iter = 1
+    
+        
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
@@ -696,7 +741,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:
-        setproctitle.setproctitle(f'zzq llama:[{iteration}/{args.train_iters}]')
+        setproctitle.setproctitle(f'zzq llama:[{iteration+1}/{args.train_iters}]')
+        iter_counter[0] = iteration+1
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
