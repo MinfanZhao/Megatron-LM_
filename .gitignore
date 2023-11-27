@@ -7,6 +7,9 @@ build
 tensorboard
 backup
 checkpoints
-data
+data/
 *.npz
 debug_*
+test_data
+scripts/temp
+eval_result/

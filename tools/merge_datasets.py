@@ -11,8 +11,14 @@ from megatron.data import indexed_dataset
 def main(args):
 
     prefixes = set()
-    for basename in os.listdir(args.input):
+    file_list = [file_path if file_path.startswith(args.file_prefix) else '' for file_path in os.listdir(args.input)]
+    file_list.sort()
+    for basename in file_list:
         prefix, ext = os.path.splitext(basename)
+        if ext == '.npy':
+            continue
+        elif ext == '.bin':
+            print(f'detect {prefix}')
 
         if prefix in prefixes:
             continue
@@ -21,6 +27,7 @@ def main(args):
             continue
 
         ext_pair = '.bin' if ext == '.idx' else '.idx'
+        
         assert os.path.isfile(os.path.join(args.input, prefix) + ext_pair), \
                f'ERROR: {ext_pair} file not provided for {os.path.join(args.input, prefix)}'
 
@@ -28,6 +35,7 @@ def main(args):
 
     builder = None
     for prefix in sorted(prefixes):
+        print(f"merging {prefix}...")
         if builder is None:
             dataset = indexed_dataset.make_dataset(os.path.join(args.input, prefix), 'infer')
 
@@ -39,16 +47,23 @@ def main(args):
             del dataset
 
         builder.merge_file_(os.path.join(args.input, prefix))
-
+    print("finalizing... ...")
     builder.finalize(args.output_prefix + '.idx')
+    print('Index has been saved at '+args.output_prefix + '.idx')
+    print('Data has been saved at '+args.output_prefix + '.bin')
 
 
 if __name__ == '__main__':
+    print("start train")
     parser = argparse.ArgumentParser()
 
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to directory containing all document files to merge')
+    
+    group = parser.add_argument_group(title='input data prefix')
+    group.add_argument('--file-prefix', type=str, default = ''
+                       )
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
