@@ -73,19 +73,17 @@ class Encoder(object):
         
         ids = {}
         for key in self.args.json_keys:
-            text = data[key].replace('<EOD>', '')
+            if not data.__contains__(key):
+                return {}, 0
+            text = data[key].replace('<EOD>', '').replace('<end>', '')
             doc_ids = []
             for sentence in Encoder.splitter.tokenize(text):
                 
                 sentence_ids = Encoder.tokenizer.tokenize(sentence)
-                # print(sentence_ids)
-                # print('############################################################################')
                 if self.args.append_bos:
                     sentence_ids.insert(0, Encoder.tokenizer.bos)
                 if self.args.append_eos:
                     sentence_ids.append(Encoder.tokenizer.eos)
-                # print(sentence_ids)
-                # print('============================================================================')
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
             if len(doc_ids) > 0 and self.args.append_eod:
@@ -166,10 +164,16 @@ def main():
     else:
         (dir_path, file_name) = os.path.split(args.input)
         file_name_list = [file_name]
-        
+    
     for file_name in file_name_list:
+        if os.path.exists("{}_{}_{}_{}.idx".format(args.output_prefix, os.path.splitext(file_name)[0], 'text', 'document')):
+            file_path = os.path.join(dir_path, file_name)
+            print("Skipping", file_path)
+            continue
+        if file_name in ['c4-train.00684-of-01024.json']:
+            continue
         if not (file_name.endswith('.json') or file_name.endswith('.jsonl')):
-            pass
+            continue
         file_path = os.path.join(dir_path, file_name)
         print("Opening", file_path)
         fin = open(file_path, 'r', encoding='utf-8')
@@ -181,7 +185,6 @@ def main():
         tokenizer = build_tokenizer(args)
         pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
-        #encoded_docs = map(encoder.encode, fin)
 
         level = "document"
         if args.split_sentences:
