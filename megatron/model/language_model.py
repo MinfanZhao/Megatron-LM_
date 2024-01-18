@@ -75,7 +75,7 @@ def get_language_model(num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
     )
     # key used for checkpoints.
     language_model_key = 'language_model'
@@ -354,6 +354,7 @@ class TransformerLanguageModel(MegatronModule):
         self.encoder_hidden_state = None
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
         self.rope_style = args.rope_style
+        self.localsize = args.localsize
 
         # Embeddings.
         if self.pre_process:
@@ -413,6 +414,8 @@ class TransformerLanguageModel(MegatronModule):
                     self_attn_mask_type=self.encoder_attn_mask_type,
                     pre_process=self.pre_process,
                     post_process=self.post_process,
+                    rope_style=self.rope_style,
+                    localsize=self.localsize,
                 )
             self._encoder_key = 'encoder'
         else:
@@ -427,7 +430,9 @@ class TransformerLanguageModel(MegatronModule):
                 layer_type=LayerType.decoder,
                 self_attn_mask_type=self.decoder_attn_mask_type,
                 pre_process=self.pre_process,
-                post_process=self.post_process)
+                post_process=self.post_process,
+                rope_style=self.rope_style,
+                localsize=self.localsize,)
             self._decoder_key = 'decoder'
         else:
             self.decoder = None
@@ -523,8 +528,7 @@ class TransformerLanguageModel(MegatronModule):
                         enc_attn_mask,
                         enc_position_ids, 
                         inference_params=inference_params,
-                        rotary_pos_emb=rotary_pos_emb,
-                        rope_style=self.rope_style)
+                        rotary_pos_emb=rotary_pos_emb)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -558,8 +562,7 @@ class TransformerLanguageModel(MegatronModule):
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
             inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            rope_style=self.rope_style)
+            rotary_pos_emb=rotary_pos_emb)
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output

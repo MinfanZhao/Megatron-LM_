@@ -37,6 +37,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_llama_args(parser)
     parser = _add_sft_args(parser)
+    parser = _add_ipt_args(parser)
     
 
     # Custom arguments.
@@ -548,7 +549,7 @@ def _add_network_size_args(parser):
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not')
     group.add_argument('--rope-style', type=str, default='megatron',
-                       choices=['megatron', 'llama'],
+                       choices=['megatron', 'llama', 'ipt'],
                        help='Use megatron or llama rope')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
@@ -1018,6 +1019,8 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--local-rank', type=int, default=None,
+                       help='local rank passed from distributed launcher.')
 
     return parser
 
@@ -1105,6 +1108,8 @@ def _add_data_args(parser):
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'LLaMASentencePieceTokenizer',
+                                'IPTSentencePieceTokenizer',
+                                'IPTSpaceTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
@@ -1284,4 +1289,18 @@ def _add_sft_args(parser):
     group.add_argument('--data-length', type=int, default=1024,
                        help='Length of  each input in the dataset.')
     group.add_argument('--padding-direction', type=str, default='left', choices=['left', 'right'])
+    return parser
+
+
+def _add_ipt_args(parser):
+    group = parser.add_argument_group(title="ipt")
+    group.add_argument('--gate-gelu', action='store_true',
+                    help='Use IPTs Gate GeLU implementation. This option'
+                    'should not be used unless for backward compatibility'
+                    'reasons.')
+    group.add_argument('--localsize', type=int, default=None,
+                       help='local size of LocalFlashAttention.')
+    group.add_argument('--train-data-exact-num-epochs', type=int, default=None,
+                       help='When building the train dataset, force it to be '
+                       'an exact number of epochs of the raw data')
     return parser

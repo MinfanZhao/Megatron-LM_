@@ -52,3 +52,12 @@ def openai_gelu(x):
 @torch.jit.script
 def erf_gelu(x):
     return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
+
+
+def gate_gelu(intermediate_parallel):
+    hshape= intermediate_parallel.shape[:-1]
+    intermediate_parallel = intermediate_parallel.view(hshape+(-1,2))
+    intermediate_parallel1,intermediate_parallel2 = intermediate_parallel[...,0],intermediate_parallel[...,1]
+    intermediate_parallel1 = torch.nn.functional.gelu(intermediate_parallel1)
+    intermediate_parallel = intermediate_parallel1 * intermediate_parallel2
+    return intermediate_parallel

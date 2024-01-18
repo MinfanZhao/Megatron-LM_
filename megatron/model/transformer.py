@@ -16,7 +16,7 @@ from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
-from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, gate_gelu
 
 try:
     from einops import rearrange
@@ -26,7 +26,10 @@ except ImportError:
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
-    flash_attn_unpadded_func = None
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
+    except ImportError:
+        flash_attn_unpadded_func = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -94,7 +97,7 @@ class ParallelMLP(MegatronModule):
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             args.hidden_size,
-            args.ffn_hidden_size * 2 if args.swiglu else args.ffn_hidden_size,
+            args.ffn_hidden_size * 2 if args.gate_gelu or args.swiglu else args.ffn_hidden_size,
             bias=self.add_bias,
             gather_output=False,
             init_method=init_method,
@@ -119,6 +122,8 @@ class ParallelMLP(MegatronModule):
             def squared_relu(x):
                 return torch.pow(F.relu(x), 2)
             self.activation_func = squared_relu
+        elif args.gate_gelu:
+            self.activation_func = gate_gelu
         else:
             self.bias_gelu_fusion = args.bias_gelu_fusion
             self.activation_func = F.gelu
@@ -347,7 +352,7 @@ class FlashSelfAttention(torch.nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
-                 device=None, dtype=None):
+                 device=None, dtype=None, localsize=None):
         super().__init__()
         assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
                                                       'e.g., with pip install flash-attn')
@@ -355,6 +360,7 @@ class FlashSelfAttention(torch.nn.Module):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+        self.localsize = localsize
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -386,12 +392,18 @@ class FlashSelfAttention(torch.nn.Module):
             cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
                         device=q.device)
             self.dropout_p = 0
-
-        output = flash_attn_unpadded_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-            self.dropout_p,
-            softmax_scale=self.softmax_scale, causal=is_causal
-        )
+        if self.localsize is None:
+            output = flash_attn_unpadded_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                self.dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal
+            )
+        else:
+            output = flash_attn_unpadded_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                self.dropout_p,
+                softmax_scale=self.softmax_scale, causal=False, window_size=(self.localsize,0)
+            )
 
         output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
         return output
@@ -407,7 +419,8 @@ class ParallelAttention(MegatronModule):
     def __init__(self, init_method,
                  output_layer_init_method, layer_number,
                  attention_type=AttnType.self_attn,
-                 attn_mask_type=AttnMaskType.padding):
+                 attn_mask_type=AttnMaskType.padding,
+                 rope_style='megatron',localsize=None):
         super(ParallelAttention, self).__init__()
         args = get_args()
         self.layer_number = max(1, layer_number)
@@ -415,6 +428,8 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = args.params_dtype
         self.sequence_parallel = args.sequence_parallel
+        self.rope_style = rope_style
+        self.localsize = localsize
 
         self.use_flash_attn = args.use_flash_attn
         if self.use_flash_attn:
@@ -474,8 +489,7 @@ class ParallelAttention(MegatronModule):
 
         if self.use_flash_attn:
             self.core_attention_flash = FlashSelfAttention(
-                causal=True, attention_dropout=args.attention_dropout
-            )
+                causal=True, attention_dropout=args.attention_dropout, localsize=self.localsize)
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -489,7 +503,7 @@ class ParallelAttention(MegatronModule):
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
-                                        rotary_pos_emb=None, rope_style='megatron'):
+                                        rotary_pos_emb=None):
         """Forward method with activation checkpointing."""
         def custom_forward(*inputs):
             query_layer = inputs[0]
@@ -521,13 +535,14 @@ class ParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask, position_ids=None,
                 encoder_output=None, inference_params=None,
-                rotary_pos_emb=None, rope_style='megatron'):
+                rotary_pos_emb=None):
         # hidden_states: [sq, b, h]
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
         is_first_step = False
+        # print("######## infrence_params: ", inference_params.shape)
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -641,9 +656,9 @@ class ParallelAttention(MegatronModule):
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
             query_layer = apply_rotary_pos_emb(
-                query_layer, q_pos_emb, rope_style=rope_style, position_ids=position_ids)
+                query_layer, q_pos_emb, rope_style=self.rope_style, position_ids=position_ids)
             key_layer = apply_rotary_pos_emb(
-                key_layer, k_pos_emb, rope_style=rope_style, position_ids=position_ids)
+                key_layer, k_pos_emb, rope_style=self.rope_style, position_ids=position_ids)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -716,7 +731,7 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 drop_path_rate=0.):
+                 drop_path_rate=0., rope_style='megatron',localsize=None):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -729,6 +744,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
         self.use_rmsnorm = args.use_rmsnorm
+        self.rope_style=rope_style
+        self.localsize = localsize
 
         # Layernorm on the input data.
         if self.use_rmsnorm:
@@ -747,7 +764,9 @@ class ParallelTransformerLayer(MegatronModule):
             output_layer_init_method,
             layer_number,
             attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type)
+            attn_mask_type=self_attn_mask_type,
+            rope_style=self.rope_style,
+            localsize=self.localsize)
         self.hidden_dropout = args.hidden_dropout
         self.bias_dropout_fusion = args.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
@@ -771,7 +790,9 @@ class ParallelTransformerLayer(MegatronModule):
                 init_method,
                 output_layer_init_method,
                 layer_number,
-                attention_type=AttnType.cross_attn)
+                attention_type=AttnType.cross_attn,
+                reopr_style=self.rope_style,
+                localsize=self.localsize)
             # Layernorm on the attention output.
             if self.use_rmsnorm:
                 self.post_inter_attention_rmsnorm = RMSNorm(
@@ -801,7 +822,7 @@ class ParallelTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask, position_ids=None,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None, rotary_pos_emb=None, rope_style='megatron'):
+                inference_params=None, rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -818,9 +839,9 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask,
                 position_ids = position_ids,
                 inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                rope_style=rope_style)
-
+                rotary_pos_emb=rotary_pos_emb)
+            
+        
         # Residual connection.
         if self.apply_residual_connection_post_norm:
             residual = norm_output
@@ -1013,7 +1034,7 @@ class ParallelTransformer(MegatronModule):
                  self_attn_mask_type=AttnMaskType.padding,
                  post_layer_norm=True,
                  pre_process=True, post_process=True,
-                 drop_path_rate=0.0):
+                 drop_path_rate=0.0, rope_style='megatron', localsize=None):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -1027,6 +1048,7 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
         self.transformer_impl = args.transformer_impl
+        self.rope_style = rope_style
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = args.recompute_granularity
@@ -1037,6 +1059,7 @@ class ParallelTransformer(MegatronModule):
 
         self.sequence_parallel = args.sequence_parallel
         self.use_rmsnorm = args.use_rmsnorm
+        self.localsize = localsize
 
         # Transformer Engine Init.
         if self.transformer_impl == 'transformer_engine':
@@ -1081,7 +1104,9 @@ class ParallelTransformer(MegatronModule):
                     layer_number,
                     layer_type=layer_type,
                     self_attn_mask_type=self_attn_mask_type,
-                    drop_path_rate=self.drop_path_rates[layer_number - 1])
+                    drop_path_rate=self.drop_path_rates[layer_number - 1],
+                    rope_style=self.rope_style,
+                    localsize=self.localsize)
             else:
                 return transformer_engine.pytorch.TransformerLayer(
                     args.hidden_size,
@@ -1177,7 +1202,7 @@ class ParallelTransformer(MegatronModule):
 
     def _checkpointed_forward(self, hidden_states, attention_mask, position_ids,
                               encoder_output, enc_dec_attn_mask,
-                              rotary_pos_emb, is_first_microbatch, rope_style='megatron'):
+                              is_first_microbatch, rotary_pos_emb):
         """Forward method with activation checkpointing."""
         def custom(start, end, is_transformer_engine=False):
             def custom_forward(*args, **kwargs):
@@ -1192,7 +1217,7 @@ class ParallelTransformer(MegatronModule):
                 return custom_forward
             else:
                 return custom_forward_transformer_engine
-
+        inference_params = None
         if self.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
@@ -1212,7 +1237,7 @@ class ParallelTransformer(MegatronModule):
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
                         hidden_states, attention_mask, position_ids, encoder_output,
-                        enc_dec_attn_mask, rotary_pos_emb, rope_style)
+                        enc_dec_attn_mask, inference_params, rotary_pos_emb)
 
                 l += self.recompute_num_layers
 
@@ -1235,7 +1260,7 @@ class ParallelTransformer(MegatronModule):
                             custom(l, l + 1),
                             self.distribute_saved_activations,
                             hidden_states, attention_mask, position_ids, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb, rope_style)
+                            enc_dec_attn_mask, inference_params, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1, is_transformer_engine=True)(
@@ -1244,7 +1269,7 @@ class ParallelTransformer(MegatronModule):
                     else:
                         hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, position_ids, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb, rope_style)
+                            enc_dec_attn_mask, inference_params, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1262,7 +1287,7 @@ class ParallelTransformer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask, position_ids=None,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None, rotary_pos_emb=None, rope_style='megatron'):
+                inference_params=None, rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
         # Checks.
@@ -1321,9 +1346,8 @@ class ParallelTransformer(MegatronModule):
                                                                position_ids,
                                                                encoder_output,
                                                                enc_dec_attn_mask,
-                                                               rotary_pos_emb,
                                                                is_first_microbatch,
-                                                               rope_style)
+                                                               rotary_pos_emb)
                 else:
                     forward_kwargs = {
                         'encoder_output': encoder_output,
@@ -1336,7 +1360,6 @@ class ParallelTransformer(MegatronModule):
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
-                        forward_kwargs['rope_style'] = rope_style
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
