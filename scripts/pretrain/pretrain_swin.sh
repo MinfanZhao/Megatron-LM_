@@ -33,8 +33,8 @@ DATA_ARGS="--data-path $DATA_PATH \
 
 
 REQUIRED_ARGS="--num-attention-heads 1 \
-              --max-position-embeddings 0 \
-              --seq-length 0"
+              --max-position-embeddings 3136 \
+              --seq-length 3136"
 
 SWIN_ARGS="--hidden-size 768 \
            --patch-size 4 \
@@ -47,7 +47,8 @@ SWIN_ARGS="--hidden-size 768 \
            --attn-drop-rate 0 \
            --drop-path-rate 0.2 \
            --ape False \
-           --constant-drop-path-rate True"
+           --constant-drop-path-rate True \
+           --bsh-tensor-shape True"
 
 
 
@@ -69,11 +70,11 @@ REGULARIZATION_ARGS="--clip-grad 1.0 \
                      --adam-beta1 0.9 \
                      --adam-beta2 0.999"
 
-LEARNING_RATE_ARGS=" --lr 4.0e-3 \
+LEARNING_RATE_ARGS=" --lr 4.0e-5 \
                      --lr-decay-style cosine \
-                     --lr-decay-iters 31250 \
+                     --lr-decay-iters 1000 \
                      --lr-warmup-fraction 0.05 \
-                     --min-lr 1.0e-5"
+                     --min-lr 1.0e-6"
 
 MODEL_PARALLEL_ARGS="--tensor-model-parallel-size 1 \
                      --pipeline-model-parallel-size 2"

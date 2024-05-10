@@ -40,8 +40,6 @@ def get_batch(data_iterator):
         images = data['image'].cuda()
         labels = data['target'].cuda()
         data['target'] = data['target'].to(torch.float16)
-        # print('before broadcast',images.dtype,labels.dtype,images.shape,labels.shape)
-        # data[1] = data[1].to(torch.float16)
         
     else:
         data = None
@@ -50,9 +48,6 @@ def get_batch(data_iterator):
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
     images = data_b['image'].cuda()
     labels = data_b['target'].to(torch.int64).cuda()
-    # print('after broadcast',images.dtype,labels.dtype,images.shape,labels.shape, images.is_contiguous(),labels.is_contiguous())
-
-    # print(f"images shape:{images.shape} labels shape:{labels.shape}")
     return images, labels
 
 def loss_func(labels, output_tensor):

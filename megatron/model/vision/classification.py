@@ -36,13 +36,13 @@ class SwinTransformerClassificationModel(MegatronModule):
         self.finetune = finetune
         self.pre_process = pre_process
         self.post_process = post_process
-        
+        self.share_word_embeddings = False
         # reserve the name "language model" to use fastmoe easier
         # actually it is a vision model
         self.language_model = SwinTransformerBackbone(
             pre_process=self.pre_process,
             post_process=self.post_process,
-            single_token_output=True,
+            single_token_output=self.post_process,
             class_token=False
         )
         
@@ -58,7 +58,9 @@ class SwinTransformerClassificationModel(MegatronModule):
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
-        self.language_model.set_input_tensor(input_tensor)
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+        self.language_model.set_input_tensor(input_tensor[0])
 
     def forward(self, x):
         x = self.language_model(x)

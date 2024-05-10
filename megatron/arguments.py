@@ -36,7 +36,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_llama_args(parser)
-    parer = _add_swin_transformer_args(parser)
+    parser = _add_swin_transformer_args(parser)
     
 
     # Custom arguments.
@@ -1291,6 +1291,8 @@ def _add_llama_args(parser):
 def _add_swin_transformer_args(parser):
     group = parser.add_argument_group(title="swin_transformer")
 
+    group.add_argument('--bsh-tensor-shape', type=bool, default=False,
+                       help='in swin, use bsh shape instead of sbh shape in other transformers.')
 
     group.add_argument('--patch-size', type=int, default=4,
                        help='patch size used in swin transformer')

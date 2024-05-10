@@ -799,7 +799,6 @@ class ParallelAttention(MegatronModule):
         # Pre-allocate memory for key-values for inference.
         # =================================================
         is_first_step = False
-        # print("######## infrence_params: ", inference_params.shape)
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -984,8 +983,6 @@ class ParallelWindowAttention(MegatronModule):
             projection_size, num_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             num_heads, world_size)
-        print(f"======================== hidden_size_per_attention_head :{self.hidden_size_per_attention_head}")
-        print(f"=========== num attention head per partition :{self.num_attention_heads_per_partition}")
         if self.add_relative_pos_embedding:
             # define a parameter table of relative position bias
             self.relative_position_bias_table = torch.nn.Parameter(
@@ -1067,7 +1064,6 @@ class ParallelWindowAttention(MegatronModule):
         # Pre-allocate memory for key-values for inference.
         # =================================================
         is_first_step = False
-        # print("######## infrence_params: ", inference_params.shape)
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -2334,6 +2330,7 @@ class ParallelSwinTransformer(MegatronModule):
         else:
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+            
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
@@ -2418,7 +2415,8 @@ class ParallelSwinTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask, position_ids=None,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None, rotary_pos_emb=None):
-        # hidden_states: [b, s, h] for swin transformer
+        
+         # hidden_states: [b, s, h] for swin transformer
 
         # Checks.
         if inference_params:
@@ -2428,7 +2426,7 @@ class ParallelSwinTransformer(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
-
+        # print(f"[ParallelSwinTransformer-forward]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) hidden_states.shape: {hidden_states.shape}")
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -2481,11 +2479,7 @@ class ParallelSwinTransformer(MegatronModule):
                         'inference_params': inference_params,
                     }
 
-                    if self.transformer_impl == 'transformer_engine':
-                        forward_kwargs['is_first_microbatch'] = is_first_microbatch
-                        forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
-                    else:
-                        forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
+                    forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
@@ -2506,7 +2500,7 @@ class ParallelSwinTransformer(MegatronModule):
                 hidden_states = self.final_rmsnorm(hidden_states)
             else:
                 hidden_states = self.final_layernorm(hidden_states)
-
+        print(f"[ParallelSwinTransformer-output]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) hidden_states.shape: {hidden_states.shape}")
         return hidden_states
 
 
