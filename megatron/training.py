@@ -696,7 +696,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:
-        setproctitle.setproctitle(f'zzq llama:[{iteration}/{args.train_iters}]')
+        setproctitle.setproctitle(f'zzq von-wenhai:[{iteration}/{args.train_iters}]')
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \

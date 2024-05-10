@@ -36,8 +36,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_llama_args(parser)
-    parser = _add_sft_args(parser)
-    parser = _add_ipt_args(parser)
+    parer = _add_swin_transformer_args(parser)
     
 
     # Custom arguments.
@@ -238,9 +237,13 @@ def validate_args(args, defaults={}):
             'cannot have both num-layers and encoder-num-layers specified'
         args.encoder_num_layers = args.num_layers
     else:
-        assert args.encoder_num_layers is not None, \
-            'either num-layers or encoder-num-layers should be specified'
-        args.num_layers = args.encoder_num_layers
+        if args.depths is not None:
+            args.num_layers = sum(args.depths)
+            args.encoder_num_layers = args.num_layers
+        else:
+            assert args.encoder_num_layers is not None, \
+                'either num-layers or encoder-num-layers should be specified'
+            args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -1284,23 +1287,48 @@ def _add_llama_args(parser):
     return parser
 
 
-def _add_sft_args(parser):
-    group = parser.add_argument_group(title="sft")
-    group.add_argument('--data-length', type=int, default=1024,
-                       help='Length of  each input in the dataset.')
-    group.add_argument('--padding-direction', type=str, default='left', choices=['left', 'right'])
-    return parser
+
+def _add_swin_transformer_args(parser):
+    group = parser.add_argument_group(title="swin_transformer")
 
 
-def _add_ipt_args(parser):
-    group = parser.add_argument_group(title="ipt")
-    group.add_argument('--gate-gelu', action='store_true',
-                    help='Use IPTs Gate GeLU implementation. This option'
-                    'should not be used unless for backward compatibility'
-                    'reasons.')
-    group.add_argument('--localsize', type=int, default=None,
-                       help='local size of LocalFlashAttention.')
-    group.add_argument('--train-data-exact-num-epochs', type=int, default=None,
-                       help='When building the train dataset, force it to be '
-                       'an exact number of epochs of the raw data')
+    group.add_argument('--patch-size', type=int, default=4,
+                       help='patch size used in swin transformer')
+    group.add_argument('--img-size', type=int, default=224,
+                       help='Image size for swin transformer')
+    group.add_argument('--in-chans', type=int, default=3,
+                       help='Number of channels in input image data')
+
+    group.add_argument('--mlp-ratio', type=int, default=4,
+                       help='mlp projection ratio')
+    
+    group.add_argument('--depths', type=int, nargs='+', 
+                       help='depths in swin transformer')
+    group.add_argument('--num-heads', type=int, nargs='+', 
+                       help='num_heads in swin transformer')
+    group.add_argument('--window-size', type=int, default=7,
+                       help='num_heads in swin transformer')
+    group.add_argument('--qkv-bias', type=bool, default=True,
+                       help='use qkv bias in swin transformer')
+    group.add_argument('--qk-scale', type=float, default=None,
+                       help='Override default qk scale of head_dim ** -0.5 if set')
+
+    group.add_argument('--drop-rate', type=float, default=0.,
+                       help='drop rate in swin transformer')
+    group.add_argument('--attn-drop-rate', type=float, default=0.,
+                       help='Attention drop rate in swin transformer')
+    group.add_argument('--drop-path-rate', type=float, default=0.1,
+                       help='drop rate in swin transformer')
+
+    group.add_argument('--ape',type=bool, default=False,
+                       help='absolute position embedding')
+    group.add_argument('--rpe',type=bool, default=False,
+                       help='swin relative position embedding')
+    group.add_argument('--patch-norm', type=bool, default=True,
+                       help='use norm in patch embedding')
+    group.add_argument('--constant-drop-path-rate', type=bool, default=False,
+                       help='use constant drop path rate')
+    
+    
+
     return parser

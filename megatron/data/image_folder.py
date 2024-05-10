@@ -227,7 +227,8 @@ class DatasetFolder(VisionDataset):
 
         # return sample, target
         train_sample = {
-            'img': sample
+            'image': sample, 
+            'target': target,
         }
         return train_sample
 
