@@ -205,6 +205,7 @@ def forward_step(forward_step_func,
     # and in decoder stack, then send encoder_hidden_state
     # downstream as well.
     model_type = get_model_type(model)
+    # print(f"[schedules forward_step] output_tensor shape {output_tensor.shape}")
 
     if parallel_state.is_pipeline_stage_after_split() and \
             model_type == ModelType.encoder_and_decoder:
@@ -771,7 +772,7 @@ def forward_backward_pipelining_without_interleaving(*,
         input_tensors = []
         output_tensors = []
     forward_data_store = []
-
+    # print(f"[schedules forward_backward_pipelining_without_interleaving] tensor shape {recv_tensor_shapes} {send_tensor_shapes}")
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)

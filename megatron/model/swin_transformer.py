@@ -2203,7 +2203,7 @@ class ParallelSwinTransformer(MegatronModule):
                  self_attn_mask_type=AttnMaskType.padding,
                  post_layer_norm=True,
                  pre_process=True, post_process=True,
-                 drop_path_rate=0.0, rope_style='megatron'):
+                 drop_path_rate=0.0, rope_style='megatron', input_resolution=None):
         super(ParallelSwinTransformer, self).__init__()
         args = get_args()
 
@@ -2228,10 +2228,14 @@ class ParallelSwinTransformer(MegatronModule):
 
         self.sequence_parallel = args.sequence_parallel
         self.use_rmsnorm = args.use_rmsnorm
+        self.input_resolution = input_resolution
         
         
         img_size, patch_size = args.img_size, args.patch_size
-        patches_resolution = [img_size // patch_size, img_size // patch_size]
+        if isinstance(img_size, list):
+            patches_resolution = [img_size[0] // patch_size[0], img_size[1] // patch_size[1]]
+        else:
+            patches_resolution = [img_size // patch_size, img_size // patch_size]
         depths = args.depths
         self.hidden_size = args.hidden_size
         self.num_heads = args.num_heads
@@ -2261,7 +2265,10 @@ class ParallelSwinTransformer(MegatronModule):
                 if layer_number < sum(depths[:stage + 1]):
                     break
             dim = int(self.hidden_size * 2 ** stage)
-            input_resolution = (patches_resolution[0] // (2 ** stage), patches_resolution[1] // (2 ** stage))
+            if self.input_resolution is None:
+                input_resolution = (patches_resolution[0] // (2 ** stage), patches_resolution[1] // (2 ** stage))
+            else:
+                input_resolution = self.input_resolution
             num_heads = self.num_heads[stage]
             inner_stage_index = layer_number - sum(depths[:stage])
             # if not self.constant_drop_path_rate:
@@ -2500,7 +2507,7 @@ class ParallelSwinTransformer(MegatronModule):
                 hidden_states = self.final_rmsnorm(hidden_states)
             else:
                 hidden_states = self.final_layernorm(hidden_states)
-        print(f"[ParallelSwinTransformer-output]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) hidden_states.shape: {hidden_states.shape}")
+        # print(f"[ParallelSwinTransformer-output]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) hidden_states.shape: {hidden_states.shape}")
         return hidden_states
 
 

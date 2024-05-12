@@ -37,6 +37,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_retro_args(parser)
     parser = _add_llama_args(parser)
     parser = _add_swin_transformer_args(parser)
+    parser = _add_wenhai_args(parser)
     
 
     # Custom arguments.
@@ -1294,9 +1295,9 @@ def _add_swin_transformer_args(parser):
     group.add_argument('--bsh-tensor-shape', type=bool, default=False,
                        help='in swin, use bsh shape instead of sbh shape in other transformers.')
 
-    group.add_argument('--patch-size', type=int, default=4,
+    group.add_argument('--patch-size', type=int, default=4, nargs='+', 
                        help='patch size used in swin transformer')
-    group.add_argument('--img-size', type=int, default=224,
+    group.add_argument('--img-size', type=int, default=224, nargs='+', 
                        help='Image size for swin transformer')
     group.add_argument('--in-chans', type=int, default=3,
                        help='Number of channels in input image data')
@@ -1333,4 +1334,15 @@ def _add_swin_transformer_args(parser):
     
     
 
+    return parser
+
+def _add_wenhai_args(parser):
+    group = parser.add_argument_group(title="wenhai")
+    group.add_argument('--in-channels', type=int, default=0,
+                       help='input channel num')
+    group.add_argument('--in-bulk-channels', type=int, default=0,
+                       help='input bulk feature channel num')
+    group.add_argument('--out-channels', type=int, default=0,
+                       help='output channel num')
+    
     return parser
