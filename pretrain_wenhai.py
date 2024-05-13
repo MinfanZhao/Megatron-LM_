@@ -17,6 +17,9 @@ from megatron.utils import get_ltor_masks_and_position_ids, get_ltor_masks_and_p
 from megatron.utils import average_losses_across_data_parallel_group
 import torch.nn.functional as F
 
+
+land_sea_mask = torch.ones(1, 1, 2041, 4320).half().cuda()
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
@@ -29,13 +32,18 @@ def model_provider(pre_process=True, post_process=True):
 def get_batch(data_iterator):
     """Build the batch."""
     # if data_iterator is not None:
-    x = torch.rand(1, 93, 2041, 4320).half().cuda()
-    x_bulk = torch.rand(1, 9, 2041, 4320).half().cuda()
-    x_next = torch.rand(1, 93, 2041, 4320).half().cuda()
-
+    x = torch.ones(1, 93, 1, 4320).half().cuda()
+    x_bulk = torch.ones(1, 9, 1, 4320).half().cuda()
+    x_next = torch.ones(1, 93, 1, 4320).half().cuda()
+    x = x.repeat(1,1,2041,1)
+    x_bulk = x_bulk.repeat(1,1,2041,1)
+    x_next = x_next.repeat(1,1,2041,1)
     return x, x_bulk, x_next
 
 def loss_func(labels, output_tensor):
+    
+    labels = labels * land_sea_mask
+    output_tensor = output_tensor * land_sea_mask
     logits = output_tensor.contiguous().float()
     loss = F.l1_loss(logits, labels)
 

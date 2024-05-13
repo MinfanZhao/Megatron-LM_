@@ -18,7 +18,6 @@
 import torch
 from megatron import get_args
 from megatron.model.utils import get_linear_layer
-from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
 from megatron.model.vision.wenhai_backbone import WenhaiBackbone
 from megatron.model.module import MegatronModule
 from torch import nn

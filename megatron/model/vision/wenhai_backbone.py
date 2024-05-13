@@ -245,10 +245,11 @@ class WenhaiBackbone(MegatronModule):
             input_resolution=(patches_resolution[0] // 2, patches_resolution[1] // 2),
         )
 
-        self.apply(self._init_weights)
         if self.post_process:
-            self.up_blk=UpBlock(self.hidden_size, self.hidden_size, num_groups=32)
+            self.up_blk = UpBlock(self.hidden_size, self.hidden_size, num_groups=32)
             self.fc = nn.Linear(self.hidden_size, self.out_chans * self.patch_size[0] * self.patch_size[1])
+            
+        self.apply(self._init_weights)
 
 
     def _init_weights(self, m):
@@ -310,7 +311,8 @@ class WenhaiBackbone(MegatronModule):
 
 
         if self.pre_process:
-            B, C, pad_lat, pad_lon, x = checkpoint(pre_process_func, x, bulk_flux, use_reentrant=False)
+            # B, C, pad_lat, pad_lon, x = checkpoint(pre_process_func, x, bulk_flux, use_reentrant=False)
+            B, C, pad_lat, pad_lon, x = pre_process_func(x, bulk_flux)
         if not x.is_contiguous():
             # print(f"[wenhai backbone forward]do contiguous")
             x = x.contiguous()
