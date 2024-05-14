@@ -5,9 +5,9 @@
 GPUS_PER_NODE=2
 DEVICES=0,1
 # Change for multinode config
-MASTER_ADDR=icarus1.acsalab.com
+MASTER_ADDR=localhost
 MASTER_PORT=6000
-NNODES=2
+NNODES=1
 NODE_RANK=$1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -29,7 +29,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
 DATA_ARGS="--data-path $DATA_PATH \
               --num-classes 1000 \
               --img-size 2041 4320 \
-              --num-workers 32"
+              --num-workers 2"
 
 
 REQUIRED_ARGS="--num-attention-heads 1 \
@@ -38,7 +38,7 @@ REQUIRED_ARGS="--num-attention-heads 1 \
 
 SWIN_ARGS="--hidden-size 768 \
            --patch-size 8 8 \
-           --depths 12 \
+           --depths 10 \
            --window-size 7 \
            --num-heads 12 \
            --patch-norm True \
@@ -57,7 +57,7 @@ WENHAI_ARGS="--in-channels 93 \
 TRAINING_ARGS="--micro-batch-size 1 \
               --global-batch-size 1 \
               --train-iters 1000 \
-              --log-interval 10 \
+              --log-interval 2 \
               --eval-interval 100 \
               --save-interval 312 \
               --eval-iters 10 \
@@ -81,13 +81,13 @@ LEARNING_RATE_ARGS=" --lr 4.0e-5 \
                      --min-lr 1.0e-6"
 
 MODEL_PARALLEL_ARGS="--tensor-model-parallel-size 1 \
-                     --pipeline-model-parallel-size 4"
+                     --pipeline-model-parallel-size 2"
 
 MIXED_PRECISION_ARGS="--fp16"
 
 
 
-CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=$DEVICES \
+CUDA_DEVICE_MAX_CONNECTIONS=1 CUDA_VISIBLE_DEVICES=$DEVICES NCCL_P2P_LEVEL=SYS NCCL_SHM_DISABLE=1 \
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_wenhai.py \
        $SWIN_ARGS \
@@ -106,5 +106,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --tensorboard-log-interval 10 \
        --distributed-backend nccl \
        --init-method-xavier-uniform  \
-       --initial-loss-scale 4096
+       --initial-loss-scale 4096 \
+       --recompute-activations \
+       --timing-log-level 2
 

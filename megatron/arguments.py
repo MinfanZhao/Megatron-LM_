@@ -1344,5 +1344,15 @@ def _add_wenhai_args(parser):
                        help='input bulk feature channel num')
     group.add_argument('--out-channels', type=int, default=0,
                        help='output channel num')
+    group.add_argument('--epochs', type=int, default=5)
+    group.add_argument('--pretrained-checkpoint', type=str, default=None,
+                       help='Pretrained checkpoint used for finetunning.')
+    group.add_argument('--keep-last', action='store_true',
+                       help='Keep the last batch (maybe incomplete) in'
+                       'the data loader')
+
+
+
+
     
     return parser
