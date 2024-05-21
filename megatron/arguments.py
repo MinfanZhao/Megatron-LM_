@@ -1350,7 +1350,10 @@ def _add_wenhai_args(parser):
     group.add_argument('--keep-last', action='store_true',
                        help='Keep the last batch (maybe incomplete) in'
                        'the data loader')
-
+    group.add_argument('--finetune-days', type=int, default=5,
+                       help='Keep the last batch (maybe incomplete) in'
+                       'the data loader')
+    group.add_argument('--inbalance-pipeline-stage', type=int, nargs='+')
 
 
 

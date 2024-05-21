@@ -35,6 +35,7 @@ from megatron.model.module import MegatronModule
 from timm.models.layers import to_2tuple, trunc_normal_
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange
+from megatron.model.vision.calcu_bulk_flux import calc_bulk_flux
 
 class DownBlock(nn.Module):
     def __init__(self, in_chans: int, out_chans: int, num_groups: int, num_residuals: int = 2):
@@ -209,7 +210,7 @@ class WenhaiBackbone(MegatronModule):
 
         self.drop_rate = args.drop_rate
         self.drop_path_rate = args.drop_path_rate
-        
+        self.input_tensor = None
         
         padding_size = 2 * self.patch_size[0] * self.window_size
         tp_padding_size = to_2tuple(padding_size)#直接一次padding，满足patch_size和window_size以及下采样需求
@@ -239,6 +240,7 @@ class WenhaiBackbone(MegatronModule):
         self.transformer = ParallelSwinTransformer(
             self.init_method,
             self.scaled_init_method,
+            post_layer_norm = False,
             pre_process=self.pre_process,
             post_process=self.post_process,
             drop_path_rate=self.drop_path_rate,
@@ -246,9 +248,10 @@ class WenhaiBackbone(MegatronModule):
         )
 
         if self.post_process:
+            self.sea_mask = torch.load('/test2/cuiyz/data/mask_GLORYS_0.083d.pt').unsqueeze(0).half().cuda()
             self.up_blk = UpBlock(self.hidden_size, self.hidden_size, num_groups=32)
             self.fc = nn.Linear(self.hidden_size, self.out_chans * self.patch_size[0] * self.patch_size[1])
-            
+            self.previous_result = None # register previous result in last stage, because wenhai only predict the difference between days 
         self.apply(self._init_weights)
 
 
@@ -264,10 +267,20 @@ class WenhaiBackbone(MegatronModule):
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
-        self.transformer.set_input_tensor(input_tensor)
+        
+        if not self.pre_process:
+            self.transformer.set_input_tensor(input_tensor)
+        else:
+            if input_tensor is not None:
+                self.input_tensor = input_tensor
+                
+    
+    def clean_finetune_buffer(self):
+        self.input_tensor = None
+        self.previous_result = None
     
 
-    def forward(self, x, bulk_flux):
+    def forward(self, x, bulk_flux, bulk_flux_idx=0):
 
         def pre_process_func(x, bulk_flux):
             x = self.initial_pad(x)
@@ -310,16 +323,32 @@ class WenhaiBackbone(MegatronModule):
             return x
 
 
+        if self.post_process:    
+            if self.previous_result is None:
+                # set for first day
+                self.previous_result = x.cuda()
+
         if self.pre_process:
+            if self.input_tensor is not None:
+                x = self.input_tensor
+                bulk_flux = calc_bulk_flux(x.detach().cpu(), bulk_flux_idx).cuda()
+            else:
+                x, bulk_flux = x.cuda(), bulk_flux.cuda()
             # B, C, pad_lat, pad_lon, x = checkpoint(pre_process_func, x, bulk_flux, use_reentrant=False)
             B, C, pad_lat, pad_lon, x = pre_process_func(x, bulk_flux)
+            # print(f"x after preprocess:{x.shape} {x}")
+               
         if not x.is_contiguous():
-            # print(f"[wenhai backbone forward]do contiguous")
             x = x.contiguous()
+        
+        
+            
         x = self.transformer(x, None)
+        
         if self.post_process:
             x = post_process_func(self.padded_size[0], self.padded_size[1], x)
-
+            if self.previous_result is not None:
+                x = x + self.previous_result
+            x = x * self.sea_mask
+            self.previous_result = x            
         return x
-
-

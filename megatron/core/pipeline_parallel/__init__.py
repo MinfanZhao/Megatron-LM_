@@ -1,1 +1,2 @@
 from .schedules import get_forward_backward_func
+from .wenhai_schedules import get_forward_backward_func as wenhai_get_forward_backward_func

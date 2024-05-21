@@ -18,7 +18,8 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, gate_gelu
 
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.layers import  to_2tuple, trunc_normal_
+from timm.models.layers import DropPath as TimmDropPath
 
 try:
     from einops import rearrange
@@ -79,6 +80,113 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
+
+def _args_to_kwargs():
+    args = get_args()
+
+    common_kwargs = {
+        "params_dtype": args.params_dtype,
+        "use_cpu_initialization": args.use_cpu_initialization,
+        "perform_initialization": args.perform_initialization,
+        "gradient_accumulation_fusion": args.gradient_accumulation_fusion,
+        "sequence_parallel_enabled": args.sequence_parallel,
+    }
+    return common_kwargs
+
+
+
+def bias_dropout_add(x, bias, residual, prob, training):
+    # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
+    if bias is not None:
+        x = x + bias
+    out = torch.nn.functional.dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
+
+
+def get_bias_dropout_add(training):
+    def _bias_dropout_add(x, bias, residual, prob):
+        return bias_dropout_add(x, bias, residual, prob, training)
+    return _bias_dropout_add
+
+
+@torch.jit.script
+def bias_dropout_add_fused_train(x: torch.Tensor,
+                                 bias: Optional[torch.Tensor],
+                                 residual: torch.Tensor,
+                                 prob: float) -> torch.Tensor:
+    return bias_dropout_add(x, bias, residual, prob, True)
+
+
+@torch.jit.script
+def bias_dropout_add_fused_inference(x: torch.Tensor,
+                                     bias: Optional[torch.Tensor],
+                                     residual: torch.Tensor,
+                                     prob: float) -> torch.Tensor:
+    return bias_dropout_add(x, bias, residual, prob, False)
+
+
+def _get_num_layers(args, is_encoder_and_decoder_model, is_decoder=False):
+    """Compute the number of transformer layers resident on the current rank."""
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if is_encoder_and_decoder_model:
+            assert args.pipeline_model_parallel_split_rank is not None
+
+            # When a standalone embedding stage is used, a rank is taken from
+            # the encoder's ranks, to be used for the encoder's embedding
+            # layer. This way, the rank referenced by the 'split rank' remains
+            # the same whether or not a standalone embedding stage is used.
+            num_ranks_in_encoder = (
+                args.pipeline_model_parallel_split_rank - 1
+                if args.standalone_embedding_stage else
+                args.pipeline_model_parallel_split_rank
+            )
+            num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
+            assert args.encoder_num_layers % num_ranks_in_encoder == 0, \
+                    'encoder_num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.encoder_num_layers, num_ranks_in_encoder)
+            assert args.decoder_num_layers % num_ranks_in_decoder == 0, \
+                    'decoder_num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.decoder_num_layers, num_ranks_in_decoder)
+            if mpu.is_pipeline_stage_before_split():
+                num_layers = (
+                    0
+                    if args.standalone_embedding_stage
+                    and mpu.get_pipeline_model_parallel_rank() == 0 else
+                    args.encoder_num_layers // num_ranks_in_encoder
+                )
+            else:
+                num_layers = args.decoder_num_layers // num_ranks_in_decoder
+        else:
+            assert args.num_layers == args.encoder_num_layers
+            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
+
+            # When a standalone embedding stage is used, all transformer layers
+            # are divided among pipeline rank >= 1, while on pipeline rank 0,
+            # ranks either contain the input embedding layer (virtual pp rank 0),
+            # or no layers at all (virtual pp rank >= 1).
+            num_layers = (
+                0
+                if args.standalone_embedding_stage
+                and mpu.get_pipeline_model_parallel_rank() == 0 else
+                args.num_layers // args.transformer_pipeline_model_parallel_size
+            )
+    else:
+        if not is_decoder:
+            num_layers = args.encoder_num_layers
+        else:
+            num_layers = args.decoder_num_layers
+    return num_layers
+
+
+def _get_num_layers_with_imbalance_pipeline_stage(args):
+    assert mpu.get_pipeline_model_parallel_world_size() > 1
+    rank = mpu.get_pipeline_model_parallel_rank()
+    inbalance_pipeline_stage = args.inbalance_pipeline_stage
+    return inbalance_pipeline_stage[rank]
+
+
+
+
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample
     (when applied in main path of residual blocks).
@@ -100,19 +208,77 @@ class DropPath(MegatronModule):
         random_tensor.floor_()  # binarize
         output = hidden_state.div(keep_prob) * random_tensor
         return output
+    
+class VisionDropPath(MegatronModule):
+    """Drop paths (Stochastic Depth) per sample
+    (when applied in main path of residual blocks).
+    """
+
+    def __init__(self, drop_prob=0.):
+        super(VisionDropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, hidden_state):
+        if self.drop_prob == 0. or not self.training:
+            return hidden_state
+        keep_prob = 1 - self.drop_prob
+        # work with diff dim tensors, not just 2D ConvNets
+        # hidden_state: [b, s, h]
+        shape = (hidden_state.shape[0],) +  (1,) + (1,) * (hidden_state.ndim - 2)
+        random_tensor = keep_prob + \
+            torch.rand(shape, dtype=hidden_state.dtype, device=hidden_state.device)
+        random_tensor.floor_()  # binarize
+        output = hidden_state.div(keep_prob) * random_tensor
+        return output
 
 
-def _args_to_kwargs():
-    args = get_args()
+class PatchMerging(torch.nn.Module):
+    r""" Patch Merging Layer.
+    Args:
+        input_resolution (tuple[int]): Resolution of input feature.
+        dim (int): Number of input channels.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
 
-    common_kwargs = {
-        "params_dtype": args.params_dtype,
-        "use_cpu_initialization": args.use_cpu_initialization,
-        "perform_initialization": args.perform_initialization,
-        "gradient_accumulation_fusion": args.gradient_accumulation_fusion,
-        "sequence_parallel_enabled": args.sequence_parallel,
-    }
-    return common_kwargs
+    def __init__(self, input_resolution, dim, norm_layer=torch.nn.LayerNorm):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.reduction = torch.nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = norm_layer(4 * dim)
+
+    def forward(self, x):
+        """
+        x: B, H*W, C
+        """
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+
+        x = x.view(B, H, W, C)
+
+        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
+        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
+
+        x = self.norm(x)
+        x = self.reduction(x)
+
+        return x
+
+    def extra_repr(self) -> str:
+        return f"input_resolution={self.input_resolution}, dim={self.dim}"
+
+    def flops(self):
+        H, W = self.input_resolution
+        flops = H * W * self.dim
+        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
+        return flops
+
 
 
 class ParallelMLP(MegatronModule):
@@ -167,81 +333,6 @@ class ParallelMLP(MegatronModule):
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             args.ffn_hidden_size,
             args.hidden_size,
-            bias=self.add_bias,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            **_args_to_kwargs())
-
-    def forward(self, hidden_states):
-
-        # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
-
-        if self.bias_gelu_fusion:
-            assert self.add_bias is True
-            assert self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-        else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
-
-        # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-        return output, output_bias
-
-
-class ParallelSwinMLP(MegatronModule):
-    """MLP.
-
-    MLP will take the input with h hidden state, project it to 4*h
-    hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension.
-    """
-
-    def __init__(self, dim, mlp_dim, init_method, output_layer_init_method):
-        super(ParallelSwinMLP, self).__init__()
-        args = get_args()
-
-        self.add_bias = args.add_bias_linear
-
-        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            dim,
-            mlp_dim,
-            bias=self.add_bias,
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
-            **_args_to_kwargs())
-
-        self.bias_gelu_fusion = False
-        self.activation_func = None
-        self.swiglu = args.swiglu
-
-        if args.openai_gelu:
-            self.activation_func = openai_gelu
-        elif args.onnx_safe:
-            self.activation_func = erf_gelu
-        elif args.swiglu:
-            def swiglu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return F.silu(x[0]) * x[1]
-            self.activation_func = swiglu
-        elif args.squared_relu:
-            def squared_relu(x):
-                return torch.pow(F.relu(x), 2)
-            self.activation_func = squared_relu
-        else:
-            self.bias_gelu_fusion = args.bias_gelu_fusion
-            self.activation_func = F.gelu
-
-        # Project back to h.
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
-            mlp_dim,
-            dim,
             bias=self.add_bias,
             input_is_parallel=True,
             init_method=output_layer_init_method,
@@ -452,151 +543,7 @@ class CoreAttention(MegatronModule):
         context_layer = context_layer.view(*new_context_layer_shape)
 
         return context_layer
-    
-
-class WindowAttention(MegatronModule):
-
-    def __init__(self, layer_number,
-                 attn_mask_type=AttnMaskType.padding,
-                 dim=512, num_heads=2):
-        super(WindowAttention, self).__init__()
-        args = get_args()
-        self.fp16 = args.fp16
-        self.bf16 = args.bf16
-
-        self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
-        self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
-        if self.apply_query_key_layer_scaling:
-            self.attention_softmax_in_fp32 = True
-        self.layer_number = max(1, layer_number)
-        self.attn_mask_type = attn_mask_type
-        self.sequence_parallel = args.sequence_parallel
-
-        projection_size = args.kv_channels * args.num_attention_heads
-
-        # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, num_heads)
-        self.num_attention_heads_per_partition = core.utils.divide(
-            num_heads, world_size)
-        self.hidden_size_per_partition = core.utils.divide(projection_size,
-                                                           world_size)
-
-        coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        if self.apply_query_key_layer_scaling:
-            coeff = self.layer_number
-            self.norm_factor *= coeff
-
-        self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            self.fp16, self.bf16,
-            self.attn_mask_type,
-            args.masked_softmax_fusion,
-            attention_mask_func,
-            self.attention_softmax_in_fp32,
-            coeff)
-
-        # Dropout. Note that for a single iteration, this layer will generate
-        # different outputs on different number of parallel partitions but
-        # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
-
-    def forward(self, query_layer, key_layer,
-                value_layer, attention_mask, relative_position_bias=None):
-
-        # ===================================
-        # Raw attention scores. [b, np, s, s]
-        # ===================================
-
-        # [b, np, sq, sk]
-        output_size = (query_layer.size(1),
-                       query_layer.size(2),
-                       query_layer.size(0),
-                       key_layer.size(0))
-
-        # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2],
-                                       output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3],
-                                   output_size[0] * output_size[1], -1)
-
-        # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-            (output_size[0]*output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype, "mpu")
-
-        # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_input_buffer,
-            query_layer.transpose(0, 1),   # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0, alpha=(1.0/self.norm_factor))
-
-        # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.view(*output_size)
-        
-        # add relative_position_bias
-        # rank = mpu.get_pipeline_model_parallel_rank()
-        #.view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH/p
-        if relative_position_bias is not None:
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH/p, Wh*Ww, Wh*Ww
-            attention_scores = attention_scores + relative_position_bias.unsqueeze(0)
-        
-        # ===========================
-        # Attention probs and dropout
-        # ===========================
-
-        # attention scores and attention mask [b, np, sq, sk]
-        attention_probs = self.scale_mask_softmax(attention_scores,
-                                                  attention_mask)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        if not self.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
-                attention_probs = self.attention_dropout(attention_probs)
-        else:
-            attention_probs = self.attention_dropout(attention_probs)
-
-        # =========================
-        # Context layer. [sq, b, hp]
-        # =========================
-
-        # value_layer -> context layer.
-        # [sk, b, np, hn] --> [b, np, sq, hn]
-
-        # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1),
-                       value_layer.size(2),
-                       query_layer.size(0),
-                       value_layer.size(3))
-
-        # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0),
-                                       output_size[0] * output_size[1], -1)
-
-        # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1],
-                                               output_size[2], -1)
-
-        # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
-
-        # change view [b, np, sq, hn]
-        context_layer = context_layer.view(*output_size)
-
-        # [b, np, sq, hn] --> [sq, b, np, hn]
-        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
-
-        # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + \
-            (self.hidden_size_per_partition,)
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        return context_layer
-
+ 
 
 class FlashSelfAttention(torch.nn.Module):
     """Implement the scaled dot product attention with softmax.
@@ -946,274 +893,6 @@ class ParallelAttention(MegatronModule):
         return output, bias
 
 
-class ParallelWindowAttention(MegatronModule):
-    """Parallel swin self-attention layer abstract class.
-
-    Self-attention layer takes input with size [s, b, h]
-    and returns output of the same size.
-    """
-
-    def __init__(self, init_method,
-                 output_layer_init_method, layer_number,
-                 attention_type=AttnType.self_attn,
-                 attn_mask_type=AttnMaskType.padding,
-                 rope_style='megatron',
-                 dim=512, num_heads=2, window_size=(7,7)):
-        super(ParallelWindowAttention, self).__init__()
-        args = get_args()
-        
-        assert args.use_flash_attn == False, 'FlashAttention is not supported for Swin Transformer'
-        assert attention_type == AttnType.self_attn, 'Only self attention is supported for Swin Transformer'
-        assert attn_mask_type == AttnMaskType.padding, 'Only padding mask is supported for Swin Transformer'
-        
-        self.layer_number = max(1, layer_number)
-        self.attention_type = attention_type
-        self.attn_mask_type = attn_mask_type
-        self.params_dtype = args.params_dtype
-        self.sequence_parallel = args.sequence_parallel
-        self.add_relative_pos_embedding = args.rpe
-
-        # use parameter dim instead of kv_channels beacuse swin block has different hidden size in different stages
-        # projection_size = args.kv_channels * args.num_attention_heads
-        projection_size = dim
-        
-        # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, num_heads)
-        self.num_attention_heads_per_partition = core.utils.divide(
-            num_heads, world_size)
-        if self.add_relative_pos_embedding:
-            # define a parameter table of relative position bias
-            self.relative_position_bias_table = torch.nn.Parameter(
-                torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_attention_heads_per_partition))  # 2*Wh-1 * 2*Ww-1, nH/p
-
-            # get pair-wise relative position index for each token inside the window
-            coords_h = torch.arange(self.window_size[0])
-            coords_w = torch.arange(self.window_size[1])
-            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-            relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-            relative_coords[:, :, 1] += self.window_size[1] - 1
-            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-            self.register_buffer("relative_position_index", relative_position_index)
-
-
-        # Strided linear layer.
-        self.query_key_value = tensor_parallel.ColumnParallelLinear(
-            projection_size,
-            3 * projection_size,
-            bias=args.add_bias_linear,
-            gather_output=False,
-            init_method=init_method,
-            async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
-            **_args_to_kwargs())
-
-
-        self.core_attention = WindowAttention(self.layer_number,
-                                            self.attn_mask_type, dim, num_heads)
-        self.checkpoint_core_attention = args.recompute_granularity == 'selective'
-
-        # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
-            projection_size,
-            projection_size,
-            bias=args.add_bias_linear,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            **_args_to_kwargs())
-
-    def _checkpointed_attention_forward(self, query_layer, key_layer,
-                                        value_layer, attention_mask,
-                                        relative_position_bias=None, ):
-        """Forward method with activation checkpointing."""
-        def custom_forward(*inputs):
-            query_layer = inputs[0]
-            key_layer = inputs[1]
-            value_layer = inputs[2]
-            attention_mask = inputs[3]
-            output_ = self.core_attention(query_layer, key_layer,
-                                          value_layer, attention_mask, relative_position_bias)
-            return output_
-
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward,
-            False, query_layer, key_layer, value_layer, attention_mask, relative_position_bias)
-
-        return hidden_states
-
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
-        return torch.empty(
-            inference_max_sequence_len,
-            batch_size,
-            self.num_attention_heads_per_partition,
-            self.hidden_size_per_attention_head,
-            dtype=self.params_dtype,
-            device=torch.cuda.current_device())
-
-    def forward(self, hidden_states, attention_mask, position_ids=None,
-                encoder_output=None, inference_params=None,
-                rotary_pos_emb=None):
-        # hidden_states: [sq, b, h]
-
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
-        is_first_step = False
-        if inference_params:
-            if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
-                inf_max_batch_size = inference_params.max_batch_size
-                inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
-                inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
-                inference_params.key_value_memory_dict[self.layer_number] = (
-                    inference_key_memory, inference_value_memory)
-                is_first_step = True
-            else:
-                inference_key_memory, inference_value_memory = \
-                    inference_params.key_value_memory_dict[self.layer_number]
-
-        # =====================
-        # Query, Key, and Value
-        # =====================
-
-        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-        mixed_x_layer, _ = self.query_key_value(hidden_states)
-
-        # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-        new_tensor_shape = mixed_x_layer.size()[:-1] + \
-            (self.num_attention_heads_per_partition,
-                3 * self.hidden_size_per_attention_head)
-        mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
-
-        # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-        (query_layer,
-            key_layer,
-            value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
-        
-        # ==================================
-        # Adjust key and value for inference
-        # ==================================
-
-        # duplicate the pos_emb for self attention
-        if rotary_pos_emb is not None:
-            if isinstance(rotary_pos_emb, tuple):
-                rotary_pos_emb = rotary_pos_emb
-            else:
-                rotary_pos_emb = ((rotary_pos_emb,) * 2)
-
-        if inference_params:
-            batch_start = inference_params.batch_size_offset
-            batch_end = batch_start + key_layer.size(1)
-            assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_params.sequence_len_offset
-            sequence_end = sequence_start + key_layer.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
-            inference_key_memory[sequence_start:sequence_end,
-                                 batch_start:batch_end, ...] = key_layer
-            inference_value_memory[sequence_start:sequence_end,
-                                   batch_start:batch_end, ...] = value_layer
-            key_layer = inference_key_memory[
-                :sequence_end, batch_start:batch_end, ...]
-            value_layer = inference_value_memory[
-                :sequence_end, batch_start:batch_end, ...]
-
-
-            # adjust the key rotary positional embedding
-            if rotary_pos_emb is not None:
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-                # need to cross check this condition during inference
-                # if not set_inference_key_value_memory:
-                if not is_first_step:
-                    # In inference, we compute one token at a time.
-                    # Select the correct positional embedding
-                    # (only the last token in the sequence)
-                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-                else:
-                    # In the first forward pass of inference,
-                    # we use the entire provided prefix.
-                    # q_pos_emb here has the rope embeddings of the entire
-                    # prefix + to-be-generated output so
-                    # we slice to just the prefix.
-                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-                rotary_pos_emb = (q_pos_emb, k_pos_emb)
-
-
-        # ==================================
-        # core attention computation
-        # ==================================
-
-        # apply relative positional encoding (rotary embedding)
-        if rotary_pos_emb is not None:
-            q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(
-                query_layer, q_pos_emb, rope_style=self.rope_style, position_ids=position_ids)
-            key_layer = apply_rotary_pos_emb(
-                key_layer, k_pos_emb, rope_style=self.rope_style, position_ids=position_ids)
-            # TODO, can apply positional embedding to value_layer so it has
-            # absolute positional embedding.
-            # otherwise, only relative positional embedding takes effect
-            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-        if self.add_relative_pos_embedding:
-            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
-        else:
-            relative_position_bias = None
-            
-            
-        if self.checkpoint_core_attention:
-            context_layer = self._checkpointed_attention_forward(
-                query_layer, key_layer, value_layer, attention_mask, relative_position_bias=relative_position_bias)
-        else:
-            context_layer = self.core_attention(
-                query_layer, key_layer, value_layer, attention_mask, relative_position_bias)
-
-        # =================
-        # Output. [sq, b, h]
-        # =================
-
-        output, bias = self.dense(context_layer)
-
-        return output, bias
-
-
-def bias_dropout_add(x, bias, residual, prob, training):
-    # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
-    if bias is not None:
-        x = x + bias
-    out = torch.nn.functional.dropout(x, p=prob, training=training)
-    out = residual + out
-    return out
-
-
-def get_bias_dropout_add(training):
-    def _bias_dropout_add(x, bias, residual, prob):
-        return bias_dropout_add(x, bias, residual, prob, training)
-    return _bias_dropout_add
-
-
-@torch.jit.script
-def bias_dropout_add_fused_train(x: torch.Tensor,
-                                 bias: Optional[torch.Tensor],
-                                 residual: torch.Tensor,
-                                 prob: float) -> torch.Tensor:
-    return bias_dropout_add(x, bias, residual, prob, True)
-
-
-@torch.jit.script
-def bias_dropout_add_fused_inference(x: torch.Tensor,
-                                     bias: Optional[torch.Tensor],
-                                     residual: torch.Tensor,
-                                     prob: float) -> torch.Tensor:
-    return bias_dropout_add(x, bias, residual, prob, False)
-
 
 class ParallelTransformerLayer(MegatronModule):
     """A single transformer layer.
@@ -1442,322 +1121,6 @@ class ParallelTransformerLayer(MegatronModule):
         return output
 
 
-class PatchMerging(torch.nn.Module):
-    r""" Patch Merging Layer.
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    def __init__(self, input_resolution, dim, norm_layer=torch.nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = torch.nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-
-    def forward(self, x):
-        """
-        x: B, H*W, C
-        """
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
-
-        x = x.view(B, H, W, C)
-
-        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
-
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.dim
-        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
-        return flops
-
-
-class ParallelSwinTransformerLayer(MegatronModule):
-    """A single transformer layer.
-
-    Transformer layer takes input with size [s, b, h] and returns an
-    output of the same size.
-    """
-
-    def __init__(self, init_method, output_layer_init_method,
-                 layer_number, layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding,
-                 rope_style='megatron',
-                 dim=512, input_resolution=(56,56), 
-                 num_heads=2, window_size=7, shift_size=0,
-                 mlp_ratio=4., drop_path_rate=0., patch_merge=False):
-        args = get_args()
-
-        super(ParallelSwinTransformerLayer, self).__init__()
-        self.layer_number = layer_number
-        self.layer_type = layer_type
-
-        self.apply_residual_connection_post_norm \
-            = args.apply_residual_connection_post_norm
-
-        self.bf16 = args.bf16
-        self.fp32_residual_connection = args.fp32_residual_connection
-        self.use_rmsnorm = args.use_rmsnorm
-        self.rope_style=rope_style
-        
-        
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        
-        mlp_dim = int(dim * mlp_ratio)
-        
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
-
-        # Layernorm on the input data.
-        if self.use_rmsnorm:
-            self.input_rmsnorm = RMSNorm(
-                dim, 
-                eps=args.rmsnorm_epsilon, 
-                sequence_parallel=args.sequence_parallel)
-        else:
-            self.input_layernorm = LayerNorm(
-                dim,
-                eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=args.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
-
-        # Self attention.
-        self.self_attention = ParallelWindowAttention(
-            init_method,
-            output_layer_init_method,
-            layer_number,
-            attention_type=AttnType.self_attn,
-            attn_mask_type=self_attn_mask_type,
-            rope_style=self.rope_style,
-            dim=dim, num_heads=num_heads, window_size=to_2tuple(self.window_size))
-
-        self.hidden_dropout = args.hidden_dropout
-        self.bias_dropout_fusion = args.bias_dropout_fusion
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
-
-        # Layernorm on the attention output
-        if self.use_rmsnorm:
-            self.post_attention_rmsnorm = RMSNorm(
-                dim, 
-                eps=args.rmsnorm_epsilon, 
-                sequence_parallel=args.sequence_parallel)
-        else:
-            self.post_attention_layernorm = LayerNorm(
-                dim,
-                eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=args.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
-
-        # MLP
-        # if args.num_experts is not None:
-        #     self.mlp = SwitchMLP(init_method, output_layer_init_method)
-        # else:
-        self.mlp = ParallelSwinMLP(dim, mlp_dim, init_method, output_layer_init_method)
-        
-        # calculate attention mask for SW-MSA
-        if self.shift_size > 0:
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            
-            # in megatron attention mask should be bool mask instead of float mask
-            attn_mask = attn_mask != 0
-            # attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
-        
-        
-
-        # attn_mask (num_windows, N, N)
-        self.register_buffer("attn_mask", attn_mask)
-
-        self.patch_merge = PatchMerging(input_resolution, dim=dim, norm_layer=torch.nn.LayerNorm) if patch_merge else torch.nn.Identity()
-
-        # Set bias+dropout+add fusion grad_enable execution handler.
-        TORCH_MAJOR = int(torch.__version__.split('.')[0])
-        TORCH_MINOR = int(torch.__version__.split('.')[1])
-        use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
-        self.bias_dropout_add_exec_handler = \
-                nullcontext if use_nvfuser else torch.enable_grad
-
-    def forward(self, hidden_states, attention_mask, position_ids=None,
-                encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None, rotary_pos_emb=None):
-        # hidden_states: [s, b, h] in the original implementation
-        # hidden_states: [b, hw, c] in the swin implementation
-        H, W = self.input_resolution
-        B, L, C = hidden_states.shape
-
-        # Layer norm at the beginning of the transformer layer.
-        if self.use_rmsnorm:
-            norm_output = self.input_rmsnorm(hidden_states)
-            # Self attention.
-            
-        else:
-            norm_output = self.input_layernorm(hidden_states)
-            # Self attention.
-        
-        # cyclic shift
-        if self.shift_size > 0:
-            shifted_hidden_states = torch.roll(hidden_states.view(B, H, W, C), shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_hidden_states = hidden_states.view(B, H, W, C)
-
-        # partition windows
-        hidden_states_windows = window_partition(shifted_hidden_states, self.window_size)  # nW*B, window_size, window_size, C
-        hidden_states_windows = hidden_states_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-
-        
-        # b, s, h -> s, b, h
-        attention_output, attention_bias = \
-            self.self_attention(
-                hidden_states_windows.transpose(0, 1).contiguous(),
-                self.attn_mask.unsqueeze(1).repeat(B, 1, 1, 1) if self.attn_mask is not None else None,
-                position_ids = position_ids,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb)
-            
-
-        # Residual connection.
-        if self.apply_residual_connection_post_norm:
-            residual = norm_output
-        else:
-            residual = hidden_states
-
-        # if self.drop_path is None:
-        #     # jit scripting for a nn.module (with dropout) is not
-        #     # trigerring the fusion kernel. For now, we use two
-        #     # different nn.functional routines to account for varying
-        #     # dropout semantics during training and inference phases.
-        #     if self.bias_dropout_fusion:
-        #         if self.training:
-        #             bias_dropout_add_func = bias_dropout_add_fused_train
-        #         else:
-        #             bias_dropout_add_func = bias_dropout_add_fused_inference
-        #     else:
-        #         bias_dropout_add_func = get_bias_dropout_add(self.training)
-
-        #     if attention_bias is not None:
-        #         attention_bias = attention_bias.expand_as(residual)
-        #     with self.bias_dropout_add_exec_handler():
-        #         norm_input = bias_dropout_add_func(
-        #             attention_output,
-        #             attention_bias,
-        #             residual,
-        #             self.hidden_dropout)
-        # else:
-        # transpose [s,b,h] -> [b,s,h]
-        attn_windows = attention_output + attention_bias
-        attn_windows = attn_windows.transpose(0, 1).contiguous()
-        
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_hidden_states = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-        
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            hidden_states = torch.roll(shifted_hidden_states, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            hidden_states = shifted_hidden_states
-        hidden_states = hidden_states.view(B, H*W, C)    
-        
-        
-        out = torch.nn.functional.dropout(hidden_states,
-                                        p=self.hidden_dropout,
-                                        training=self.training)
-        
-        
-        norm_input = residual + self.drop_path(out)
-
-        # Layer norm post the self attention.
-        if self.use_rmsnorm:
-            norm_output = self.post_attention_rmsnorm(norm_input)
-        else:
-            norm_output = self.post_attention_layernorm(norm_input)
-
-        # MLP.
-        mlp_output, mlp_bias = self.mlp(norm_output)
-
-        # Second residual connection.
-        if self.apply_residual_connection_post_norm:
-            residual = norm_output
-        else:
-            residual = norm_input
-
-        # if self.drop_path is None:
-        #     if mlp_bias is not None:
-        #         mlp_bias = mlp_bias.expand_as(residual)
-        #     with self.bias_dropout_add_exec_handler():
-        #         output = bias_dropout_add_func(
-        #             mlp_output,
-        #             mlp_bias,
-        #             residual,
-        #             self.hidden_dropout)
-
-        #     # Jit compiled function creates 'view' tensor. This tensor
-        #     # potentially gets saved in the MPU checkpoint function context,
-        #     # which rejects view tensors. While making a viewless tensor here
-        #     # won't result in memory savings (like the data loader, or
-        #     # p2p_communication), it serves to document the origin of this
-        #     # 'view' tensor.
-        #     output = core.utils.make_viewless_tensor(inp = output,
-        #                                              requires_grad = output.requires_grad,
-        #                                              keep_graph = True)
-
-        # else:
-        if mlp_bias is not None:
-            mlp_output = mlp_output + mlp_bias
-        out = torch.nn.functional.dropout(mlp_output,
-                                            p=self.hidden_dropout,
-                                            training=self.training)
-        output = residual + self.drop_path(out)
-        
-        output = self.patch_merge(output)
-
-        return output
-    
 
 class NoopTransformerLayer(MegatronModule):
     """A single 'no-op' transformer layer.
@@ -1781,60 +1144,9 @@ class NoopTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask, position_ids,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None):
+                inference_params=None, rotary_pos_emb=None):
         return hidden_states.clone()
 
-
-def _get_num_layers(args, is_encoder_and_decoder_model, is_decoder=False):
-    """Compute the number of transformer layers resident on the current rank."""
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        if is_encoder_and_decoder_model:
-            assert args.pipeline_model_parallel_split_rank is not None
-
-            # When a standalone embedding stage is used, a rank is taken from
-            # the encoder's ranks, to be used for the encoder's embedding
-            # layer. This way, the rank referenced by the 'split rank' remains
-            # the same whether or not a standalone embedding stage is used.
-            num_ranks_in_encoder = (
-                args.pipeline_model_parallel_split_rank - 1
-                if args.standalone_embedding_stage else
-                args.pipeline_model_parallel_split_rank
-            )
-            num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
-            assert args.encoder_num_layers % num_ranks_in_encoder == 0, \
-                    'encoder_num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.encoder_num_layers, num_ranks_in_encoder)
-            assert args.decoder_num_layers % num_ranks_in_decoder == 0, \
-                    'decoder_num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.decoder_num_layers, num_ranks_in_decoder)
-            if mpu.is_pipeline_stage_before_split():
-                num_layers = (
-                    0
-                    if args.standalone_embedding_stage
-                    and mpu.get_pipeline_model_parallel_rank() == 0 else
-                    args.encoder_num_layers // num_ranks_in_encoder
-                )
-            else:
-                num_layers = args.decoder_num_layers // num_ranks_in_decoder
-        else:
-            assert args.num_layers == args.encoder_num_layers
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
-
-            # When a standalone embedding stage is used, all transformer layers
-            # are divided among pipeline rank >= 1, while on pipeline rank 0,
-            # ranks either contain the input embedding layer (virtual pp rank 0),
-            # or no layers at all (virtual pp rank >= 1).
-            num_layers = (
-                0
-                if args.standalone_embedding_stage
-                and mpu.get_pipeline_model_parallel_rank() == 0 else
-                args.num_layers // args.transformer_pipeline_model_parallel_size
-            )
-    else:
-        if not is_decoder:
-            num_layers = args.encoder_num_layers
-        else:
-            num_layers = args.decoder_num_layers
-    return num_layers
 
 
 class ParallelTransformer(MegatronModule):
@@ -2195,6 +1507,646 @@ class ParallelTransformer(MegatronModule):
         return hidden_states
 
 
+################ Parallel Swin Transformer ################
+
+
+class ParallelSwinMLP(MegatronModule):
+    """MLP.
+
+    MLP will take the input with h hidden state, project it to 4*h
+    hidden dimension, perform nonlinear transformation, and project the
+    state back into h hidden dimension.
+    """
+
+    def __init__(self, dim, mlp_dim, init_method, output_layer_init_method):
+        super(ParallelSwinMLP, self).__init__()
+        args = get_args()
+
+        self.add_bias = args.add_bias_linear
+
+        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+            dim,
+            mlp_dim,
+            bias=self.add_bias,
+            gather_output=False,
+            init_method=init_method,
+            skip_bias_add=True,
+            async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
+            **_args_to_kwargs())
+
+        self.bias_gelu_fusion = False
+        self.activation_func = None
+        self.swiglu = args.swiglu
+
+        if args.openai_gelu:
+            self.activation_func = openai_gelu
+        elif args.onnx_safe:
+            self.activation_func = erf_gelu
+        elif args.swiglu:
+            def swiglu(x):
+                x = torch.chunk(x, 2, dim=-1)
+                return F.silu(x[0]) * x[1]
+            self.activation_func = swiglu
+        elif args.squared_relu:
+            def squared_relu(x):
+                return torch.pow(F.relu(x), 2)
+            self.activation_func = squared_relu
+        else:
+            self.bias_gelu_fusion = args.bias_gelu_fusion
+            self.activation_func = F.gelu
+
+        # Project back to h.
+        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
+            mlp_dim,
+            dim,
+            bias=self.add_bias,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True,
+            **_args_to_kwargs())
+
+    def forward(self, hidden_states):
+
+        # [s, b, 4hp]
+        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+
+        if self.bias_gelu_fusion:
+            assert self.add_bias is True
+            assert self.activation_func == F.gelu
+            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        else:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+
+        # [s, b, h]
+        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        return output, output_bias
+
+
+class WindowAttention(MegatronModule):
+
+    def __init__(self, layer_number,
+                 attn_mask_type=AttnMaskType.padding,
+                 dim=512, num_heads=2):
+        super(WindowAttention, self).__init__()
+        args = get_args()
+        self.fp16 = args.fp16
+        self.bf16 = args.bf16
+
+        self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
+        self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
+        if self.apply_query_key_layer_scaling:
+            self.attention_softmax_in_fp32 = True
+        self.layer_number = max(1, layer_number)
+        self.attn_mask_type = attn_mask_type
+        self.sequence_parallel = args.sequence_parallel
+
+        projection_size = args.kv_channels * args.num_attention_heads
+
+        # Per attention head and per partition values.
+        world_size = mpu.get_tensor_model_parallel_world_size()
+        self.hidden_size_per_attention_head = core.utils.divide(
+            projection_size, num_heads)
+        self.num_attention_heads_per_partition = core.utils.divide(
+            num_heads, world_size)
+        self.hidden_size_per_partition = core.utils.divide(projection_size,
+                                                           world_size)
+
+        coeff = None
+        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        if self.apply_query_key_layer_scaling:
+            coeff = self.layer_number
+            self.norm_factor *= coeff
+
+        self.scale_mask_softmax = FusedScaleMaskSoftmax(
+            self.fp16, self.bf16,
+            self.attn_mask_type,
+            args.masked_softmax_fusion,
+            attention_mask_func,
+            self.attention_softmax_in_fp32,
+            coeff)
+
+        # Dropout. Note that for a single iteration, this layer will generate
+        # different outputs on different number of parallel partitions but
+        # on average it should not be partition dependent.
+        self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
+
+    def forward(self, query_layer, key_layer,
+                value_layer, attention_mask, relative_position_bias=None):
+
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1),
+                       query_layer.size(2),
+                       query_layer.size(0),
+                       key_layer.size(0))
+
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2],
+                                       output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3],
+                                   output_size[0] * output_size[1], -1)
+
+        # preallocting input tensor: [b * np, sq, sk]
+        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+            (output_size[0]*output_size[1], output_size[2], output_size[3]),
+            query_layer.dtype, "mpu")
+
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer.transpose(0, 1),   # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0, alpha=(1.0/self.norm_factor))
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+        # print(f"attention scores:{attention_scores.shape} {attention_scores}")
+        
+        # add relative_position_bias
+        # rank = mpu.get_pipeline_model_parallel_rank()
+        
+        if relative_position_bias is not None:
+            # print(f"attention scores shape:{attention_scores.shape} relative_position_bias shape:{relative_position_bias.shape}")
+            attention_scores = attention_scores + relative_position_bias.unsqueeze(0)
+        # print(f"attention scores after bias:{attention_scores.shape} {attention_scores}")
+        
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+        # print(f"attention mask:{attention_mask}")
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = self.scale_mask_softmax(attention_scores,
+                                                  attention_mask)
+
+
+        # print(f"attention probs after mask softmax:{attention_probs.shape} {attention_probs}")
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        if not self.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
+            attention_probs = self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1),
+                       value_layer.size(2),
+                       query_layer.size(0),
+                       value_layer.size(3))
+
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0),
+                                       output_size[0] * output_size[1], -1)
+
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1],
+                                               output_size[2], -1)
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + \
+            (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        
+        
+
+        return context_layer
+
+
+class ParallelWindowAttention(MegatronModule):
+    """Parallel swin self-attention layer abstract class.
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(self, init_method,
+                 output_layer_init_method, layer_number,
+                 attention_type=AttnType.self_attn,
+                 attn_mask_type=AttnMaskType.padding,
+                 rope_style='megatron',
+                 dim=512, num_heads=2, window_size=(7,7)):
+        super(ParallelWindowAttention, self).__init__()
+        args = get_args()
+        
+        assert args.use_flash_attn == False, 'FlashAttention is not supported for Swin Transformer'
+        assert attention_type == AttnType.self_attn, 'Only self attention is supported for Swin Transformer'
+        assert attn_mask_type == AttnMaskType.padding, 'Only padding mask is supported for Swin Transformer'
+        
+        self.layer_number = max(1, layer_number)
+        self.attention_type = attention_type
+        self.attn_mask_type = attn_mask_type
+        self.params_dtype = args.params_dtype
+        self.sequence_parallel = args.sequence_parallel
+        self.add_relative_pos_embedding = args.rpe
+
+        # use parameter dim instead of kv_channels beacuse swin block has different hidden size in different stages
+        # projection_size = args.kv_channels * args.num_attention_heads
+        projection_size = dim
+        self.window_size = window_size
+        # Per attention head and per partition values.
+        world_size = mpu.get_tensor_model_parallel_world_size()
+        self.hidden_size_per_attention_head = core.utils.divide(
+            projection_size, num_heads)
+        self.num_attention_heads_per_partition = core.utils.divide(
+            num_heads, world_size)
+        if self.add_relative_pos_embedding:
+            # define a parameter table of relative position bias
+            self.relative_position_bias_table = torch.nn.Parameter(
+                torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), self.num_attention_heads_per_partition))  # 2*Wh-1 * 2*Ww-1, nH/p
+
+            # get pair-wise relative position index for each token inside the window
+            coords_h = torch.arange(self.window_size[0])
+            coords_w = torch.arange(self.window_size[1])
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+            coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+            relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+            relative_coords[:, :, 1] += self.window_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+            relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+            self.register_buffer("relative_position_index", relative_position_index)
+
+
+        # Strided linear layer.
+        self.query_key_value = tensor_parallel.ColumnParallelLinear(
+            projection_size,
+            3 * projection_size,
+            bias=args.add_bias_linear,
+            gather_output=False,
+            init_method=init_method,
+            async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
+            **_args_to_kwargs())
+
+
+        self.core_attention = WindowAttention(self.layer_number,
+                                            self.attn_mask_type, dim, num_heads)
+        self.checkpoint_core_attention = args.recompute_granularity == 'selective'
+
+        # Output.
+        self.dense = tensor_parallel.RowParallelLinear(
+            projection_size,
+            projection_size,
+            bias=args.add_bias_linear,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True,
+            **_args_to_kwargs())
+
+    def _checkpointed_attention_forward(self, query_layer, key_layer,
+                                        value_layer, attention_mask,
+                                        relative_position_bias=None, ):
+        """Forward method with activation checkpointing."""
+        def custom_forward(*inputs):
+            query_layer = inputs[0]
+            key_layer = inputs[1]
+            value_layer = inputs[2]
+            attention_mask = inputs[3]
+            relative_position_bias = inputs[4]
+            output_ = self.core_attention(query_layer, key_layer,
+                                          value_layer, attention_mask, relative_position_bias)
+            return output_
+
+        hidden_states = tensor_parallel.checkpoint(
+            custom_forward,
+            False, query_layer, key_layer, value_layer, attention_mask, relative_position_bias)
+
+        return hidden_states
+
+    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+        return torch.empty(
+            inference_max_sequence_len,
+            batch_size,
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+            dtype=self.params_dtype,
+            device=torch.cuda.current_device())
+
+    def forward(self, hidden_states, attention_mask, position_ids=None,
+                encoder_output=None, inference_params=None,
+                rotary_pos_emb=None):
+        # hidden_states: [sq, b, h]
+
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+
+        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+        mixed_x_layer, _ = self.query_key_value(hidden_states)
+        mixed_x_layer_t = mixed_x_layer.transpose(0,1)
+        # print(f"qkv:{mixed_x_layer_t.shape} {mixed_x_layer_t}")
+
+        # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+        new_tensor_shape = mixed_x_layer.size()[:-1] + \
+            (self.num_attention_heads_per_partition,
+                3 * self.hidden_size_per_attention_head)
+        mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+
+        # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+        (query_layer,
+            key_layer,
+            value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+        reorder_q = query_layer.permute(1,2,0,3)
+        # print(f"q {reorder_q.shape} {reorder_q}")
+        
+        # ==================================
+        # Adjust key and value for inference
+        # ==================================
+
+        if self.add_relative_pos_embedding:
+            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)]
+            relative_position_bias = relative_position_bias.view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH/p
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH/p, Wh*Ww, Wh*Ww
+        else:
+            relative_position_bias = None
+            
+            
+        if self.checkpoint_core_attention:
+            context_layer = self._checkpointed_attention_forward(
+                query_layer, key_layer, value_layer, attention_mask, relative_position_bias=relative_position_bias)
+        else:
+            context_layer = self.core_attention(
+                query_layer, key_layer, value_layer, attention_mask, relative_position_bias=relative_position_bias)
+        context_layer_t = context_layer.transpose(0,1)
+        # print(f"context_layer result:{context_layer_t.shape}  {context_layer_t.dtype} {context_layer_t}")
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        output, bias = self.dense(context_layer)
+
+        return output, bias
+
+
+class ParallelSwinTransformerLayer(MegatronModule):
+    """A single transformer layer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+    """
+
+    def __init__(self, init_method, output_layer_init_method,
+                 layer_number, layer_type=LayerType.encoder,
+                 self_attn_mask_type=AttnMaskType.padding,
+                 rope_style='megatron',
+                 dim=512, input_resolution=(56,56), 
+                 num_heads=2, window_size=7, shift_size=0,
+                 mlp_ratio=4., drop_path_rate=0., patch_merge=False):
+        args = get_args()
+
+        super(ParallelSwinTransformerLayer, self).__init__()
+        self.layer_number = layer_number
+        self.layer_type = layer_type
+
+        self.apply_residual_connection_post_norm \
+            = args.apply_residual_connection_post_norm
+
+        self.bf16 = args.bf16
+        self.fp32_residual_connection = args.fp32_residual_connection
+        self.use_rmsnorm = args.use_rmsnorm
+        self.rope_style=rope_style
+        
+        
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        
+        mlp_dim = int(dim * mlp_ratio)
+        
+        if min(self.input_resolution) <= self.window_size:
+            # if window size is larger than input resolution, we don't partition windows
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+
+        # Layernorm on the input data.
+        if self.use_rmsnorm:
+            self.input_rmsnorm = RMSNorm(
+                dim, 
+                eps=args.rmsnorm_epsilon, 
+                sequence_parallel=args.sequence_parallel)
+        else:
+            self.input_layernorm = LayerNorm(
+                dim,
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=args.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+
+        # Self attention.
+        self.self_attention = ParallelWindowAttention(
+            init_method,
+            output_layer_init_method,
+            layer_number,
+            attention_type=AttnType.self_attn,
+            attn_mask_type=self_attn_mask_type,
+            rope_style=self.rope_style,
+            dim=dim, num_heads=num_heads, window_size=to_2tuple(self.window_size))
+
+        self.hidden_dropout = args.hidden_dropout
+        self.bias_dropout_fusion = args.bias_dropout_fusion
+        self.drop_path = TimmDropPath(drop_path_rate) #if drop_path_rate > 0.0 else None
+
+        # Layernorm on the attention output
+        if self.use_rmsnorm:
+            self.post_attention_rmsnorm = RMSNorm(
+                dim, 
+                eps=args.rmsnorm_epsilon, 
+                sequence_parallel=args.sequence_parallel)
+        else:
+            self.post_attention_layernorm = LayerNorm(
+                dim,
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=args.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+
+        # MLP
+        # if args.num_experts is not None:
+        #     self.mlp = SwitchMLP(init_method, output_layer_init_method)
+        # else:
+        self.mlp = ParallelSwinMLP(dim, mlp_dim, init_method, output_layer_init_method)
+        
+        # calculate attention mask for SW-MSA
+        if self.shift_size > 0:
+            # print(f"input resolution:{self.input_resolution}")
+            H, W = self.input_resolution
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            
+            # in megatron attention mask should be bool mask instead of float mask
+            attn_mask = attn_mask == 0
+            # attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+            
+        else:
+            attn_mask = None
+        
+        
+
+        # attn_mask (num_windows, N, N)
+        self.register_buffer("attn_mask", attn_mask)
+
+        self.patch_merge = PatchMerging(input_resolution, dim=dim, norm_layer=torch.nn.LayerNorm) if patch_merge else torch.nn.Identity()
+
+        # Set bias+dropout+add fusion grad_enable execution handler.
+        TORCH_MAJOR = int(torch.__version__.split('.')[0])
+        TORCH_MINOR = int(torch.__version__.split('.')[1])
+        use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
+        self.bias_dropout_add_exec_handler = \
+                nullcontext if use_nvfuser else torch.enable_grad
+
+    def forward(self, hidden_states, attention_mask, position_ids=None,
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None, rotary_pos_emb=None):
+        # hidden_states: [s, b, h] in the original implementation
+        # hidden_states: [b, hw, c] in the swin implementation
+        H, W = self.input_resolution
+        B, L, C = hidden_states.shape
+
+        # Layer norm at the beginning of the transformer layer.
+        if self.use_rmsnorm:
+            norm_output = self.input_rmsnorm(hidden_states)
+            # Self attention.
+            
+        else:
+            norm_output = self.input_layernorm(hidden_states)
+            
+    
+        # print(f"x after norm 1:{norm_output}")
+            # Self attention.
+        
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_hidden_states = torch.roll(norm_output.view(B, H, W, C), shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_hidden_states = norm_output.view(B, H, W, C)
+
+        # partition windows
+        hidden_states_windows = window_partition(shifted_hidden_states, self.window_size)  # nW*B, window_size, window_size, C
+        hidden_states_windows = hidden_states_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        # b, s, h -> s, b, h
+        attention_output, attention_bias = \
+            self.self_attention(
+                hidden_states_windows.transpose(0, 1).contiguous(),
+                self.attn_mask.unsqueeze(1).repeat(B, 1, 1, 1) if self.attn_mask is not None else None,
+                position_ids = position_ids,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb)
+            
+
+        # Residual connection.
+        if self.apply_residual_connection_post_norm:
+            residual = norm_output
+        else:
+            residual = hidden_states
+
+        # transpose [s,b,h] -> [b,s,h]
+        attn_windows = attention_output + attention_bias
+        attn_windows = attn_windows.transpose(0, 1).contiguous()
+        
+        
+        
+        ########################### DONE #########################
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        
+        # print(f"attn_windows after view:{attn_windows.shape}")
+        
+        
+        shifted_hidden_states = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            hidden_states = torch.roll(shifted_hidden_states, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            hidden_states = shifted_hidden_states
+        hidden_states = hidden_states.view(B, H*W, C)
+        # print(f"x after attention :{hidden_states.shape} {hidden_states}")
+        
+        out = torch.nn.functional.dropout(hidden_states,
+                                        p=self.hidden_dropout,
+                                        training=self.training)
+        
+        # print(f"x after dropout :{out.shape} {out}")
+        drop_path_result = self.drop_path(out)
+        # print(f"x after droppath :{drop_path_result.shape} {drop_path_result}")
+        # print(f"shorcut input:{residual.shape} {residual}")
+        norm_input = residual + out
+        
+        
+        
+        # print(f"x after shortcut:{norm_input.shape} {norm_input}")
+
+        # Layer norm post the self attention.
+        if self.use_rmsnorm:
+            norm_output = self.post_attention_rmsnorm(norm_input)
+        else:
+            norm_output = self.post_attention_layernorm(norm_input)
+
+        # MLP.
+        mlp_output, mlp_bias = self.mlp(norm_output)
+
+        # Second residual connection.
+        if self.apply_residual_connection_post_norm:
+            residual = norm_output
+        else:
+            residual = norm_input
+
+        if mlp_bias is not None:
+            mlp_output = mlp_output + mlp_bias
+        out = torch.nn.functional.dropout(mlp_output,
+                                            p=self.hidden_dropout,
+                                            training=self.training)
+        output = residual + self.drop_path(out)
+        
+        output = self.patch_merge(output)
+
+        return output
+    
+
 class ParallelSwinTransformer(MegatronModule):
     """Transformer class."""
 
@@ -2250,10 +2202,14 @@ class ParallelSwinTransformer(MegatronModule):
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
         
         # Number of layers.
-        self.num_layers = _get_num_layers(
-            args,
-            args.model_type == ModelType.encoder_and_decoder,
-            layer_type == LayerType.decoder)
+        if args.inbalance_pipeline_stage is not None:
+            self.num_layers = _get_num_layers_with_imbalance_pipeline_stage(args)
+            
+        else:
+            self.num_layers = _get_num_layers(
+                args,
+                args.model_type == ModelType.encoder_and_decoder,
+                layer_type == LayerType.decoder)
         
         # wenhai use constant drop path rate
         if not self.constant_drop_path_rate:
@@ -2280,7 +2236,7 @@ class ParallelSwinTransformer(MegatronModule):
             return ParallelSwinTransformerLayer(
                 init_method,
                 output_layer_init_method,
-                layer_number,
+                layer_number + 1,
                 layer_type = layer_type,
                 self_attn_mask_type = self_attn_mask_type,
                 dim = dim, input_resolution = input_resolution,
@@ -2321,7 +2277,11 @@ class ParallelSwinTransformer(MegatronModule):
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                if args.inbalance_pipeline_stage is not None:
+                    rank = mpu.get_pipeline_model_parallel_rank() 
+                    offset = sum(args.inbalance_pipeline_stage[:rank])
+                else:
+                    offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
                 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
@@ -2336,7 +2296,7 @@ class ParallelSwinTransformer(MegatronModule):
             self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
         else:
             self.layers = torch.nn.ModuleList(
-                [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+                [build_layer(i + offset) for i in range(self.num_layers)])
             
 
         if self.post_process and self.post_layer_norm:
@@ -2417,6 +2377,7 @@ class ParallelSwinTransformer(MegatronModule):
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
         forward_step_func"""
+        
         self.input_tensor = input_tensor
 
     def forward(self, hidden_states, attention_mask, position_ids=None,
@@ -2432,7 +2393,9 @@ class ParallelSwinTransformer(MegatronModule):
 
         if not self.pre_process:
             # See set_input_tensor()
+            # print(f"[ParallelSwinTransformer-forward]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) use input tensor as hidden state {type(self.input_tensor)}")
             hidden_states = self.input_tensor
+        
         # print(f"[ParallelSwinTransformer-forward]({mpu.get_pipeline_model_parallel_rank()},{mpu.get_tensor_model_parallel_rank()}) hidden_states.shape: {hidden_states.shape}")
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -2490,12 +2453,13 @@ class ParallelSwinTransformer(MegatronModule):
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
-
+                        # print(f"[{mpu.get_pipeline_model_parallel_rank()}] x before layer {index}:{hidden_states.shape} {hidden_states}")
                         hidden_states = layer(
                             hidden_states,
                             attention_mask,
                             position_ids,
                             **forward_kwargs)
+                        # print(f"[{mpu.get_pipeline_model_parallel_rank()}] x after layer {index}:{hidden_states.shape} {hidden_states}")
 
                 # Skip counter update for eval and activation checkpointing
                 if torch.is_grad_enabled() and self.training:
@@ -2503,6 +2467,8 @@ class ParallelSwinTransformer(MegatronModule):
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
+            
+            print("do final layer norm")
             if self.use_rmsnorm:
                 hidden_states = self.final_rmsnorm(hidden_states)
             else:

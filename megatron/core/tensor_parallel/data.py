@@ -9,7 +9,7 @@ from megatron.core.parallel_state import (
 )
 
 
-_MAX_DATA_DIM = 5
+_MAX_DATA_DIM = 6
 
 
 def _check_data_types(keys, data, target_dtype):

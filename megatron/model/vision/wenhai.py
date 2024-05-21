@@ -47,8 +47,45 @@ class WenhaiModel(MegatronModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         self.language_model.set_input_tensor(input_tensor[0])
+    
+    def clean_finetune_buffer(self):
+        self.language_model.clean_finetune_buffer()
 
     def forward(self, x, x_bulk):
         x = self.language_model(x, x_bulk)
+        return x
+    
+    
+class WenhaiFinetuneModel(MegatronModule):
+    """Swin Transformer Model."""
 
+    def __init__(self, pre_process=True, post_process=True):
+        super(WenhaiFinetuneModel, self).__init__()
+        args = get_args()
+        self.num_stages = len(args.depths)
+        hidden_size = args.hidden_size
+        self.num_features = int(hidden_size * 2 ** (self.num_stages - 1))
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.share_word_embeddings = False
+        # reserve the name "language model" to use fastmoe easier
+        # actually it is a vision model
+        self.language_model = WenhaiBackbone(
+            pre_process=self.pre_process,
+            post_process=self.post_process,
+        )
+
+    def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+        self.language_model.set_input_tensor(input_tensor[0])
+        
+    def clean_finetune_buffer(self):
+        self.language_model.clean_finetune_buffer()
+
+    def forward(self, x, bulk_flux, bulk_flux_index=0):
+         
+        x = self.language_model(x, bulk_flux, bulk_flux_index)
+        
         return x

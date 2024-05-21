@@ -26,56 +26,38 @@ def model_provider(pre_process=True, post_process=True):
 
 
 def get_batch(data_iterator):
-    """Build the batch."""
-    # # if data_iterator is not None:
-    # x = torch.ones(1, 93, 1, 4320).half().cuda()
-    # x_bulk = torch.ones(1, 9, 1, 4320).half().cuda()
-    # x_next = torch.ones(1, 93, 1, 4320).half().cuda()
-    # x = x.repeat(1,1,2041,1)
-    # x_bulk = x_bulk.repeat(1,1,2041,1)
-    # x_next = x_next.repeat(1,1,2041,1)
-    # return x, x_bulk, x_next
     """Generate a batch"""
     args = get_args()
+    
+    def data_broad_cast_helper(data, datatype):
+        return tensor_parallel.broadcast_data({'x'}, {'x':data}, datatype)['x']
 
     # Items and their type.
-    keys = ['x','x_bulk','x_next']
+    keys = ['x','x_bulk','x_next', 'sea_mask']
     datatype = torch.half
-    # print("in get_batch")
     # Broadcast data.
     if data_iterator is not None:
-        # print("get batch data")
-        # print("data_iterator: ", data_iterator)
-        x, x_next, x_bulk = next(data_iterator)
+        x, x_next, x_bulk, sea_mask, loss_weight = next(data_iterator)
         
-        # print("do next")
-        x = x.half().cuda().repeat(1,1,2041,1)
-        x_bulk = x_bulk.half().cuda().repeat(1,1,2041,1)
-        x_next = x_next.half().cuda().repeat(1,1,2041,1)
-        data = {'x':x_next, 'x_bulk':x_bulk, 'x_next':x_next}
+        # print(f"before broadcast x:{x}")
     else:
-        # print("no data")
-        data = None
-    # print("before broadcast")
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
-    # print('after broadcast')
+        x, x_next, x_bulk, sea_mask, loss_weight = None, None, None, None, None
+    x = data_broad_cast_helper(x, torch.half)
+    x_next = data_broad_cast_helper(x_next, torch.half)
+    x_bulk = data_broad_cast_helper(x_bulk, torch.half)
+    sea_mask = data_broad_cast_helper(sea_mask, torch.half)
+    loss_weight = data_broad_cast_helper(loss_weight, torch.half)
 
-    # Unpack.
-    x = data_b['x']
-    x_bulk = data_b['x_bulk']
-    x_next = data_b['x_next']
+    # print(f"after broadcast x:{x}")
     
-    return x, x_next, x_bulk
+    return x, x_next, x_bulk, sea_mask, loss_weight
 
-def loss_func(labels, output_tensor):
+def loss_func(labels, sea_mask, loss_weight, output_tensor, non_loss_data=False):
     
-    labels = labels
-    output_tensor = output_tensor
-    logits = output_tensor.contiguous().float()
-    loss = F.l1_loss(logits, labels)
+    labels = labels * sea_mask
+    loss = F.l1_loss(output_tensor * loss_weight, labels * loss_weight)
 
     averaged_loss = average_losses_across_data_parallel_group([loss])
-
     return loss, {"loss": averaged_loss[0]}
 
 
@@ -86,13 +68,17 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    x, x_next, x_bulk = get_batch(data_iterator)
+    x, x_next, x_bulk, sea_mask, loss_weight = get_batch(data_iterator)
+    x = x.cuda()
+    x_next = x_next.cuda()
+    x_bulk = x_bulk.cuda()
+    sea_mask = sea_mask.cuda()
+    loss_weight = loss_weight.cuda()
     timers('batch-generator').stop()
-
+    
     output_tensor = model(x, x_bulk)
-    # print(f"[pretrain wenhai forward step] output_tensor shape: {output_tensor.shape} {output_tensor.is_contiguous()}") 
-
-    return output_tensor, partial(loss_func, x_next)
+   
+    return output_tensor, partial(loss_func, x_next, sea_mask, loss_weight)
 
 
 def train_valid_test_datasets_provider():
