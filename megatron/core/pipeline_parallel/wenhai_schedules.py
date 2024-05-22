@@ -167,7 +167,8 @@ def forward_step(forward_step_func,
                  timers,
                  collect_non_loss_data=False,
                  day=0,
-                 is_finetune=False):
+                 is_finetune=False,
+                 loss_weight=None):
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data, otherwise
@@ -197,12 +198,12 @@ def forward_step(forward_step_func,
 
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
-            output_tensor = loss_func(output_tensor)
+            output_tensor = loss_func(output_tensor, loss_weight)
             loss, loss_reduced = output_tensor
             output_tensor = loss / num_microbatches
             forward_data_store.append(loss_reduced)
         else:
-            data = loss_func(output_tensor, non_loss_data=True)
+            data = loss_func(output_tensor, loss_weight, non_loss_data=True)
             forward_data_store.append(data)
 
     if timers is not None:
@@ -489,7 +490,8 @@ def forward_backward_pipelining_wenhai(*,
                                                      forward_only: bool = False,
                                                      timers: Callable = None,
                                                      collect_non_loss_data: bool = True, 
-                                                     total_day: int = 8):
+                                                     total_day: int = 8,
+                                                     loss_weight: torch.Tensor = None):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 
@@ -548,7 +550,8 @@ def forward_backward_pipelining_wenhai(*,
     ###################### First day ########################
     input_tensor = wenhai_recv_forward(recv_tensor_shapes, dtype, timers=timers, is_first_day=True)
     [loss_tensor] = wenhai_recv_forward(recv_loss_tensor_shapes, dtype, timers=timers, is_first_day=True)
-    output_tensor = forward_step(forward_step_func, data, model, num_microbatches, input_tensor, forward_data_store,timers, collect_non_loss_data, day=0, is_finetune=True)
+    output_tensor = forward_step(forward_step_func, data, model, num_microbatches, input_tensor, forward_data_store,
+                                 timers, collect_non_loss_data, day=0, is_finetune=True, loss_weight=loss_weight)
     
     if parallel_state.is_pipeline_last_stage():
         (new_loss_tensor, new_loss_reduced) = forward_data_store[-1]
@@ -573,7 +576,8 @@ def forward_backward_pipelining_wenhai(*,
     for day in range(1, total_day):
         input_tensor = wenhai_recv_forward(recv_tensor_shapes, dtype, timers=timers, is_first_day = False)
         [loss_tensor] = wenhai_recv_forward(recv_loss_tensor_shapes, dtype, timers=timers, is_first_day=False)
-        output_tensor = forward_step(forward_step_func, data, model, num_microbatches, input_tensor, forward_data_store,timers, collect_non_loss_data, day=day, is_finetune=True)
+        output_tensor = forward_step(forward_step_func, data, model, num_microbatches, input_tensor, forward_data_store,
+                                     timers, collect_non_loss_data, day=day, is_finetune=True, loss_weight=loss_weight)
         if parallel_state.is_pipeline_last_stage():
             (new_loss_tensor, new_loss_reduced) = forward_data_store[-1]
             new_loss_tensor = loss_tensor + new_loss_tensor

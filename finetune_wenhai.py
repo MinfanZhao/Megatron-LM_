@@ -44,20 +44,19 @@ def get_batch(data_iterator):
         bulk_and_mask = None
         day_index = None
         print("data iterator is none")
-    data_b = {'x_days': x_days['x_days'], 'x_bulk':bulk_and_mask['x_bulk'], 'sea_mask':bulk_and_mask['sea_mask'], 'day_index': day_index['day_index']}
-    #     x_days = None
-    #     bulk_and_mask = None
-    #     day_index = None
-    # x_days_b = tensor_parallel.broadcast_data({'x_days'}, x_days, datatype)
-    # bulk_and_mask_b = tensor_parallel.broadcast_data(['x_bulk', 'sea_mask'], bulk_and_mask, datatype)
-    # day_index_b = tensor_parallel.broadcast_data(['day_index'], day_index, torch.int64)
-    # data_b = {'x_days': x_days_b['x_days'], 'x_bulk':bulk_and_mask_b['x_bulk'], 'sea_mask':bulk_and_mask_b['sea_mask'], 'day_index': day_index_b['day_index']}
+    data_b = {'x_days': x_days['x_days'], 'x_bulk':bulk_and_mask['x_bulk'], 
+              'sea_mask':bulk_and_mask['sea_mask'], 'day_index': day_index['day_index'],}
     return data_b
 
-def loss_func(label, sea_mask, output_tensor, non_loss_data=False):
+def loss_func(label, sea_mask, output_tensor, loss_weight, non_loss_data=False):
     
-    masked_label = label * sea_mask
-    loss = F.l1_loss(output_tensor, masked_label)
+    sea_mask = sea_mask.cuda()
+    label = label * sea_mask 
+    if loss_weight is not None:
+        output_tensor = output_tensor * loss_weight
+        label = label * loss_weight
+    
+    loss = F.l1_loss(output_tensor, label)
 
     averaged_loss = average_losses_across_data_parallel_group([loss])
     return loss, {"loss": averaged_loss[0]}
@@ -72,7 +71,7 @@ def forward_step(data, model, day=0):
     timers('batch-generator', log_level=2).start()
     x_days = data['x_days']
     x_bulk = data['x_bulk']
-    sea_mask = data['sea_mask'].cuda()
+    sea_mask = data['sea_mask']
     day_index = data['day_index'].item()
     x_next = x_days[day + 1].cuda()
     timers('batch-generator').stop()

@@ -19,7 +19,6 @@ from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
-from megatron.training import train_step
 from megatron.utils import calc_params_l2_norm
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.initialize import initialize_megatron
@@ -143,7 +142,10 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
 
     # Tracking loss.
     losses_dict_sum = {}
-
+    if finetune:
+        loss_weight = torch.load('/test2/cuiyz/data/weight_Sx4.5.pt').half().cuda()
+    else:
+        loss_weight = None
     # Starting epoch and iteration
     start_epoch = args.iteration // args.train_iters_per_epoch
     start_iteration = args.iteration % args.train_iters_per_epoch
@@ -175,7 +177,8 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            out = train_step(forward_step, get_batch_func, data_iterator, model, optimizer, opt_param_scheduler, is_finetune=finetune)
+            out = train_step(forward_step, get_batch_func, data_iterator, model, optimizer, 
+                             opt_param_scheduler, is_finetune=finetune, loss_weight=loss_weight)
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
@@ -216,7 +219,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 if finetune:
                     wenhai_evaluate_and_print_results(prefix, forward_step, get_batch_func,
                                             valid_data_iterator, model,
-                                            iteration, None, True, is_finetune=True)
+                                            iteration, None, True, is_finetune=True, loss_weight=loss_weight)
                 else:
                     wenhai_evaluate_and_print_results(prefix, forward_step,
                                             valid_data_iterator, model,
@@ -420,7 +423,7 @@ def finetune_by_epoch(train_valid_datasets_provider, model_provider,
     
     
 def train_step(forward_step_func, get_batch_func, data_iterator,
-               model, optimizer, opt_param_scheduler, is_finetune=False):
+               model, optimizer, opt_param_scheduler, is_finetune=False, loss_weight=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -452,7 +455,8 @@ def train_step(forward_step_func, get_batch_func, data_iterator,
             sequence_parallel=args.sequence_parallel,
             forward_only=False,
             timers=fwd_bwd_timers,
-            total_day=args.finetune_days)
+            total_day=args.finetune_days,
+            loss_weight=loss_weight)
     else:
         forward_backward_func = wenhai_get_forward_backward_func(is_finetune=False)
         losses_reduced = forward_backward_func(
@@ -706,7 +710,7 @@ def evaluate(forward_step_func,
              data_iterator,
              model,
              process_non_loss_data_func,
-             verbose=False, is_finetune=False):
+             verbose=False, is_finetune=False, loss_weight=None):
     """Evaluation."""
     args = get_args()
     timers = get_timers()
@@ -742,7 +746,8 @@ def evaluate(forward_step_func,
                     sequence_parallel=args.sequence_parallel,
                     forward_only=True,
                     timers=fwd_bwd_timers,
-                    total_day=args.finetune_days)
+                    total_day=args.finetune_days,
+                    loss_weight=loss_weight)
                 print_rank_last(f"eval iter:{iteration} | forward backward done")
             else:
                 forward_backward_func = wenhai_get_forward_backward_func(is_finetune=False)
@@ -776,7 +781,7 @@ def evaluate(forward_step_func,
                     if loss_reduced.__contains__("loss"):
                         loss_reduced["loss"] += sum(losses)
                     else:
-                        loss_reduced["loss"] = 0
+                        loss_reduced["loss"] = sum(losses)
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
@@ -805,14 +810,14 @@ def evaluate(forward_step_func,
 def wenhai_evaluate_and_print_results(prefix, forward_step_func, get_batch_func, 
                                data_iterator, model,
                                iteration, process_non_loss_data_func,
-                               verbose=False, is_finetune = False):
+                               verbose=False, is_finetune = False, loss_weight = None):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     writer = get_tensorboard_writer()
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, get_batch_func, data_iterator, model,
-        process_non_loss_data_func, verbose, is_finetune)
+        process_non_loss_data_func, verbose, is_finetune, loss_weight)
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
